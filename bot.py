@@ -9,7 +9,7 @@ from telethon.tl.types import Message
 
 import config
 import database as db_module
-from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk
+from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk, transfer_bulk_files
 from utils import build_message_url
 
 logger = logging.getLogger(__name__)
@@ -80,9 +80,12 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             "**Commands:**\n"
             "`/transfer <url> <target>` — Transfer a single message\n"
             "`/bulk <source> <target>` — Transfer entire channel\n"
+            "`/bulkfiles <source> <target>` — Transfer media-only (oldest first)\n"
             "`/status [job_id]` — Show job progress\n"
             "`/cancel <job_id>` — Cancel a bulk job\n"
-            "`/help` — Show this message"
+            "`/help` — Show this message\n\n"
+            "You can also send or forward any file to the bot and reply with a "
+            "target channel to upload it there."
         )
 
     @bot.on(events.NewMessage(pattern=r"/transfer (.+)"))
@@ -188,6 +191,62 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             logger.error(f"Bulk start error: {e}", exc_info=True)
             await status_msg.edit(f"Error: {e}")
 
+    @bot.on(events.NewMessage(pattern=r"/bulkfiles (.+)"))
+    async def cmd_bulkfiles(event):
+        if not is_admin(event.sender_id):
+            return await event.reply("Access denied.")
+
+        args = event.pattern_match.group(1).split()
+        if len(args) < 2:
+            return await event.reply("Usage: `/bulkfiles <source_chat> <target_chat>`")
+
+        source_ref, target_ref = args[0], args[1]
+        status_msg = await event.reply("Starting media-only bulk transfer...")
+
+        try:
+            source_chat = await resolve_chat(userbot, source_ref)
+            target_chat = await resolve_chat(userbot, target_ref)
+
+            job_id = await db_module.create_job(db, event.sender_id, source_ref, target_ref)
+            cancel_event = asyncio.Event()
+
+            async def run_bulkfiles():
+                try:
+                    await transfer_bulk_files(
+                        userbot, source_chat, target_chat, job_id, db, config, cancel_event
+                    )
+                    job = await db_module.get_job(db, job_id)
+                    try:
+                        await bot.send_message(
+                            event.sender_id,
+                            f"Media-only bulk transfer job #{job_id} completed: "
+                            f"{job.transferred} transferred, "
+                            f"{len(job.failed_ids)} failed.",
+                        )
+                    except Exception:
+                        pass
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Bulkfiles job {job_id} error: {e}", exc_info=True)
+                    await db_module.update_job(db, job_id, status="failed", error=str(e))
+                finally:
+                    active_tasks.pop(job_id, None)
+
+            task = asyncio.create_task(run_bulkfiles())
+            active_tasks[job_id] = (task, cancel_event)
+
+            await status_msg.edit(
+                f"Media-only bulk transfer started! Job ID: `{job_id}`\n"
+                f"Source: {source_ref} → Target: {target_ref}\n"
+                f"Files will be transferred oldest-first.\n"
+                f"Use `/status {job_id}` to check progress."
+            )
+
+        except Exception as e:
+            logger.error(f"Bulkfiles start error: {e}", exc_info=True)
+            await status_msg.edit(f"Error: {e}")
+
     @bot.on(events.NewMessage(pattern=r"/status ?(\d*)"))
     async def cmd_status(event):
         if not is_admin(event.sender_id):
@@ -236,8 +295,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
         sender_id = event.sender_id
 
-        # Step 1: new forwarded message with media
-        if event.fwd_from and event.media:
+        # Step 1: message with media (directly sent or forwarded) — store and ask for target
+        if event.media:
             pending_forwards[sender_id] = event.message
             await event.reply(
                 "Where should I send this? Reply with the channel username or URL."

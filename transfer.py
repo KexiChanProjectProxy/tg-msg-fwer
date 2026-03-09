@@ -225,7 +225,7 @@ async def transfer_album(
     return sent if isinstance(sent, list) else [sent]
 
 
-async def transfer_bulk(
+async def transfer_bulk_files(
     userbot: TelegramClient,
     source_chat,
     target_chat,
@@ -234,12 +234,34 @@ async def transfer_bulk(
     cfg,
     cancel_event: asyncio.Event,
 ):
-    """
-    Transfer all messages from source to target using a producer-consumer pipeline.
+    """Transfer only media messages from source to target, oldest first.
 
-    The producer iterates messages and downloads media, putting prepared items onto a
-    bounded queue. The consumer takes from the queue, uploads, and records in the DB.
-    Download of message N+1 overlaps with upload of message N for improved throughput.
+    Wraps transfer_bulk with media_only=True.
+    """
+    await transfer_bulk(
+        userbot, source_chat, target_chat, job_id, db, cfg, cancel_event, media_only=True
+    )
+
+
+async def transfer_bulk(
+    userbot: TelegramClient,
+    source_chat,
+    target_chat,
+    job_id: int,
+    db,
+    cfg,
+    cancel_event: asyncio.Event,
+    media_only: bool = False,
+):
+    """
+    Transfer messages from source to target using a producer-consumer pipeline.
+
+    The producer iterates messages oldest-first and downloads media, putting prepared
+    items onto a bounded queue. The consumer takes from the queue, uploads, and records
+    in the DB. Download of message N+1 overlaps with upload of message N for throughput.
+
+    When media_only=True, text-only messages are skipped; all media types and albums
+    are transferred in their original channel order.
     """
     total_list = await userbot.get_messages(source_chat, limit=1)
     total = total_list.total
@@ -270,6 +292,10 @@ async def transfer_bulk(
                 if message.action:
                     continue
                 if message.id in transferred_ids:
+                    continue
+
+                # In media-only mode skip text messages (albums always have media)
+                if media_only and not message.media and not message.grouped_id:
                     continue
 
                 source_url = build_message_url(source_chat, message.id)
