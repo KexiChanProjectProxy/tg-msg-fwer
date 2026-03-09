@@ -68,14 +68,54 @@ def get_media_type(message) -> str:
     return "document"
 
 
+def guess_extension_from_bytes(buf: io.BytesIO) -> str:
+    """
+    Detect the file format of *buf* using magic bytes and return a file extension.
+
+    The buffer position is restored to 0 after reading.
+    Returns a bare extension string without a dot, e.g. ``"jpg"``, ``"mp4"``.
+    Falls back to ``"bin"`` if no signature matches.
+    """
+    header = buf.read(12)
+    buf.seek(0)
+
+    if header[:3] == b'\xff\xd8\xff':
+        return "jpg"
+    if header[:8] == b'\x89PNG\r\n\x1a\n':
+        return "png"
+    if header[:4] == b'GIF8':
+        return "gif"
+    if header[:4] == b'RIFF' and header[8:12] == b'WEBP':
+        return "webp"
+    if header[:4] == b'\x1aE\xdf\xa3':
+        return "mkv"
+    if header[:4] == b'OggS':
+        return "ogg"
+    if header[:4] == b'fLaC':
+        return "flac"
+    if header[:3] == b'ID3':
+        return "mp3"
+    if header[:2] == b'\xff\xfb' or header[:2] == b'\xff\xf3' or header[:2] == b'\xff\xf2':
+        return "mp3"
+    # ISO Base Media / MP4: bytes 4-8 = "ftyp"
+    if len(header) >= 8 and header[4:8] == b'ftyp':
+        return "mp4"
+
+    return "bin"
+
+
 async def probe_extension(buf: io.BytesIO) -> str:
     """
-    Use ffprobe to detect the format of *buf* and return a matching file extension.
+    Detect the file format of *buf*, trying magic bytes first, then ffprobe.
 
     The buffer position is restored to 0 after probing.
     Returns a bare extension string without a dot, e.g. ``"jpg"``, ``"mp4"``.
-    Falls back to ``"bin"`` if detection fails.
+    Falls back to ``"bin"`` if both methods fail.
     """
+    ext = guess_extension_from_bytes(buf)
+    if ext != "bin":
+        return ext
+
     loop = asyncio.get_event_loop()
     ext = await loop.run_in_executor(None, _probe_extension_sync, buf.read())
     buf.seek(0)

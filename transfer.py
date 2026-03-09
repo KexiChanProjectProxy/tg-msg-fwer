@@ -15,7 +15,7 @@ from telethon.tl.types import (
 
 import database as db_module
 import config
-from media import get_media_type, needs_video_conversion, convert_video, ensure_faststart
+from media import get_media_type, needs_video_conversion, convert_video, ensure_faststart, probe_extension
 from utils import build_message_url, retry_on_flood, rate_limit_sleep
 
 logger = logging.getLogger(__name__)
@@ -649,6 +649,10 @@ async def _download_to_bytes(userbot: TelegramClient, message: Message, cache=No
                 if isinstance(attr, DocumentAttributeFilename):
                     buf.name = attr.file_name
                     break
+        # For photos and docs without a filename, detect from magic bytes then ffprobe
+        if not getattr(buf, "name", None):
+            ext = await probe_extension(buf)
+            buf.name = f"file.{ext}"
 
         if cache and file_id:
             await cache.put(file_id, buf.getvalue())
