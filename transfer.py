@@ -3,12 +3,14 @@ import io
 import logging
 from typing import List, Optional, Set, Tuple
 
-from telethon import TelegramClient
+from telethon import TelegramClient, utils as tl_utils
 from telethon.tl.types import (
     Message,
     MessageMediaPoll,
     DocumentAttributeVideo,
     DocumentAttributeFilename,
+    PeerChannel,
+    PeerChat,
 )
 
 import database as db_module
@@ -23,19 +25,48 @@ _MAX_FILE_SIZE = 4 * 1024 ** 3 if config.IS_PREMIUM else 2 * 1024 ** 3
 
 
 async def resolve_chat(userbot: TelegramClient, chat_ref: str):
-    """Resolve a chat reference (username, URL, or numeric ID string) to an entity."""
+    """Resolve a chat reference (username, URL, or numeric ID string) to an entity.
+
+    Accepted formats
+    ----------------
+    - @username or plain username
+    - https://t.me/username  or  t.me/c/<channel_id>/<msg_id>
+    - Bot API channel ID  : -1001234567890  (strips -100, wraps in PeerChannel)
+    - Raw positive ID     : 1234567890      (tried as PeerChannel first)
+    - Legacy group chat ID: -456            (tried as PeerChat)
+    """
+    chat_ref = chat_ref.strip()
+
+    # ── URL handling ────────────────────────────────────────────────────────
     if "t.me/" in chat_ref:
         parts = chat_ref.split("t.me/")[-1].split("/")
         if parts[0] == "c" and len(parts) > 1:
-            chat_ref = int("-100" + parts[1])
+            # t.me/c/<channel_id>[/<msg_id>] — already a raw channel int
+            return await userbot.get_entity(PeerChannel(int(parts[1])))
         else:
-            chat_ref = parts[0]
+            # t.me/username[/...]
+            return await userbot.get_entity(parts[0])
+
+    # ── Numeric ID handling ─────────────────────────────────────────────────
+    try:
+        numeric = int(chat_ref)
+    except (ValueError, TypeError):
+        # Not a number — treat as username/invite link as-is
+        return await userbot.get_entity(chat_ref)
+
+    if numeric < 0:
+        s = str(numeric)
+        if s.startswith("-100"):
+            # Bot API channel/supergroup ID: -100<real_id>
+            real_id = int(s[4:])
+            return await userbot.get_entity(PeerChannel(real_id))
+        else:
+            # Legacy group chat ID: -<chat_id>
+            real_id = abs(numeric)
+            return await userbot.get_entity(PeerChat(real_id))
     else:
-        try:
-            chat_ref = int(chat_ref)
-        except (ValueError, TypeError):
-            pass
-    return await userbot.get_entity(chat_ref)
+        # Positive raw ID — assume channel/supergroup
+        return await userbot.get_entity(PeerChannel(numeric))
 
 
 async def resolve_message(userbot: TelegramClient, chat, msg_id: int) -> List[Message]:
