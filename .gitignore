@@ -22,3 +22,7 @@ build/
 venv/
 .venv/
 env/
+
+# Temp download files and cache
+tmp/
+cache/

@@ -16,4 +16,4 @@ CONCURRENT_TRANSFERS = int(os.environ.get("CONCURRENT_TRANSFERS", "3"))
 CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
 MAX_CACHE_SIZE = int(os.environ.get("MAX_CACHE_SIZE", str(1024 * 1024 * 1024)))  # bytes, default 1 GB
 # Real disk path for temp files during transfer — must NOT be a tmpfs mount
-TEMP_DIR = Path(os.environ.get("TEMP_DIR", "/var/tmp/tg-reload"))
+TEMP_DIR = Path(os.environ.get("TEMP_DIR", "tmp"))
