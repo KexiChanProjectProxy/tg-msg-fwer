@@ -28,6 +28,29 @@ async def rate_limit_sleep(base_delay: float):
     await asyncio.sleep(max(0.0, base_delay + jitter))
 
 
+def make_upload_progress_cb(label: str, log: logging.Logger, pct_step: int = 10):
+    """
+    Return a Telethon-compatible progress_callback that logs every pct_step percent.
+
+    ``label`` is included in the log line (e.g. "msg 42" or "album").
+    """
+    last_milestone = [-1]
+
+    def cb(sent: int, total: int):
+        if total <= 0:
+            return
+        pct = int(sent / total * 100)
+        milestone = (pct // pct_step) * pct_step
+        if milestone > last_milestone[0]:
+            last_milestone[0] = milestone
+            log.info(
+                f"Upload {label}: {milestone}% "
+                f"({sent / 1024**2:.1f} / {total / 1024**2:.1f} MB)"
+            )
+
+    return cb
+
+
 def retry_on_flood(max_retries: int = 3):
     """Decorator that retries on FloodWaitError with exponential back-off."""
     def decorator(func):

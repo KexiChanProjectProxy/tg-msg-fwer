@@ -16,7 +16,7 @@ from telethon.tl.types import (
 import database as db_module
 import config
 from media import get_media_type, needs_video_conversion, convert_video, ensure_faststart, probe_extension
-from utils import build_message_url, retry_on_flood, rate_limit_sleep
+from utils import build_message_url, retry_on_flood, rate_limit_sleep, make_upload_progress_cb
 
 logger = logging.getLogger(__name__)
 
@@ -131,6 +131,7 @@ async def transfer_one_message(
             caption=caption,
             formatting_entities=message.entities,
             force_document=False,
+            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
 
     elif media_type == "video":
@@ -155,6 +156,7 @@ async def transfer_one_message(
             attributes=[DocumentAttributeVideo(
                 duration=duration, w=w, h=h, supports_streaming=True
             )],
+            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
 
     elif media_type == "voice":
@@ -167,6 +169,7 @@ async def transfer_one_message(
             caption=caption,
             formatting_entities=message.entities,
             voice_note=True,
+            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
 
     elif media_type == "video_note":
@@ -178,6 +181,7 @@ async def transfer_one_message(
             file=buf,
             caption=caption,
             video_note=True,
+            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
 
     elif media_type == "animation":
@@ -189,6 +193,7 @@ async def transfer_one_message(
             file=buf,
             caption=caption,
             formatting_entities=message.entities,
+            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
 
     else:
@@ -202,6 +207,7 @@ async def transfer_one_message(
             caption=caption,
             formatting_entities=message.entities,
             force_document=True,
+            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
 
 
@@ -248,10 +254,12 @@ async def transfer_album(
         else:
             captions.append(msg.message or "")
 
+    first_id = messages[0].id
     sent = await userbot.send_file(
         target_chat,
         file=media_list,
         caption=captions,
+        progress_callback=make_upload_progress_cb(f"album msg {first_id}", logger),
     )
     return sent if isinstance(sent, list) else [sent]
 
@@ -445,7 +453,10 @@ async def transfer_bulk(
                             else:
                                 captions.append(msg.message or "")
                         sent = await userbot.send_file(
-                            target_chat, file=bufs, caption=captions
+                            target_chat, file=bufs, caption=captions,
+                            progress_callback=make_upload_progress_cb(
+                                f"album msg {album_messages[0].id}", logger
+                            ),
                         )
                         if sent:
                             for orig_msg in album_messages:
@@ -523,6 +534,8 @@ async def _upload_prepared(
 
     media_type = get_media_type(message)
 
+    progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
+
     if media_type == "photo":
         return await userbot.send_file(
             target_chat,
@@ -530,6 +543,7 @@ async def _upload_prepared(
             caption=caption,
             formatting_entities=message.entities,
             force_document=False,
+            progress_callback=progress_cb,
         )
 
     elif media_type == "video":
@@ -551,6 +565,7 @@ async def _upload_prepared(
             attributes=[DocumentAttributeVideo(
                 duration=duration, w=w, h=h, supports_streaming=True
             )],
+            progress_callback=progress_cb,
         )
 
     elif media_type == "voice":
@@ -560,6 +575,7 @@ async def _upload_prepared(
             caption=caption,
             formatting_entities=message.entities,
             voice_note=True,
+            progress_callback=progress_cb,
         )
 
     elif media_type == "video_note":
@@ -568,6 +584,7 @@ async def _upload_prepared(
             file=buf,
             caption=caption,
             video_note=True,
+            progress_callback=progress_cb,
         )
 
     elif media_type == "animation":
@@ -576,6 +593,7 @@ async def _upload_prepared(
             file=buf,
             caption=caption,
             formatting_entities=message.entities,
+            progress_callback=progress_cb,
         )
 
     else:
@@ -585,6 +603,7 @@ async def _upload_prepared(
             caption=caption,
             formatting_entities=message.entities,
             force_document=True,
+            progress_callback=progress_cb,
         )
 
 
