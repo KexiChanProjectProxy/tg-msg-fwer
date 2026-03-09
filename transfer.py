@@ -16,6 +16,7 @@ from telethon.tl.types import (
 import database as db_module
 import config
 from media import get_media_type, needs_video_conversion, convert_video, ensure_faststart, probe_extension
+from telegraph import find_telegraph_urls, fetch_telegraph_page, download_telegraph_images
 from utils import build_message_url, retry_on_flood, rate_limit_sleep, make_upload_progress_cb
 
 logger = logging.getLogger(__name__)
@@ -104,11 +105,13 @@ async def transfer_one_message(
     caption = _build_caption(message.message or "", source_url)
 
     if not message.media:
-        return await userbot.send_message(
+        sent = await userbot.send_message(
             target_chat,
             message=caption,
             formatting_entities=message.entities,
         )
+        await _expand_telegraph(userbot, message.message, target_chat)
+        return sent
 
     # Size guard
     file_size = _get_file_size(message)
@@ -125,7 +128,7 @@ async def transfer_one_message(
         buf = await _download_to_bytes(userbot, message, cache)
         if buf is None:
             return None
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -147,7 +150,7 @@ async def transfer_one_message(
         duration = getattr(video_attr, "duration", 0) or 0
         w = getattr(video_attr, "w", 0) or 0
         h = getattr(video_attr, "h", 0) or 0
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -163,7 +166,7 @@ async def transfer_one_message(
         buf = await _download_to_bytes(userbot, message, cache)
         if buf is None:
             return None
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -176,7 +179,7 @@ async def transfer_one_message(
         buf = await _download_to_bytes(userbot, message, cache)
         if buf is None:
             return None
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -188,7 +191,7 @@ async def transfer_one_message(
         buf = await _download_to_bytes(userbot, message, cache)
         if buf is None:
             return None
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -201,7 +204,7 @@ async def transfer_one_message(
         buf = await _download_to_bytes(userbot, message, cache)
         if buf is None:
             return None
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -209,6 +212,9 @@ async def transfer_one_message(
             force_document=True,
             progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
         )
+
+    await _expand_telegraph(userbot, message.message, target_chat)
+    return sent
 
 
 @retry_on_flood(max_retries=3)
@@ -526,18 +532,20 @@ async def _upload_prepared(
     caption = _build_caption(message.message or "", source_url)
 
     if buf is None:
-        return await userbot.send_message(
+        sent = await userbot.send_message(
             target_chat,
             message=caption,
             formatting_entities=message.entities,
         )
+        await _expand_telegraph(userbot, message.message, target_chat)
+        return sent
 
     media_type = get_media_type(message)
 
     progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
 
     if media_type == "photo":
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -556,7 +564,7 @@ async def _upload_prepared(
         duration = getattr(video_attr, "duration", 0) or 0
         w = getattr(video_attr, "w", 0) or 0
         h = getattr(video_attr, "h", 0) or 0
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -569,7 +577,7 @@ async def _upload_prepared(
         )
 
     elif media_type == "voice":
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -579,7 +587,7 @@ async def _upload_prepared(
         )
 
     elif media_type == "video_note":
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -588,7 +596,7 @@ async def _upload_prepared(
         )
 
     elif media_type == "animation":
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -597,7 +605,7 @@ async def _upload_prepared(
         )
 
     else:
-        return await userbot.send_file(
+        sent = await userbot.send_file(
             target_chat,
             file=buf,
             caption=caption,
@@ -605,6 +613,48 @@ async def _upload_prepared(
             force_document=True,
             progress_callback=progress_cb,
         )
+
+    await _expand_telegraph(userbot, message.message, target_chat)
+    return sent
+
+
+async def _expand_telegraph(userbot: TelegramClient, text: str, target_chat) -> None:
+    """
+    If *text* contains any telegra.ph URLs, fetch each page and send its
+    content (title + body text + images) to *target_chat* as follow-up messages.
+
+    Images are batched into albums of up to 10 (Telegram limit).
+    Errors are logged as warnings and do not propagate.
+    """
+    urls = find_telegraph_urls(text or "")
+    for url in urls:
+        try:
+            logger.info(f"Expanding Telegraph URL: {url}")
+            title, body, image_urls = await fetch_telegraph_page(url)
+
+            header = f"**{title}**\n\n" if title else ""
+            content_text = (header + body).strip()
+
+            images = await download_telegraph_images(image_urls)
+
+            if images:
+                # Send in batches of 10; attach text to the first batch only
+                for i in range(0, len(images), 10):
+                    batch = images[i : i + 10]
+                    caption = content_text if i == 0 else ""
+                    await userbot.send_file(
+                        target_chat,
+                        file=batch,
+                        caption=caption,
+                        progress_callback=make_upload_progress_cb(
+                            f"telegraph {url[-30:]}", logger
+                        ),
+                    )
+            elif content_text:
+                await userbot.send_message(target_chat, content_text)
+
+        except Exception as e:
+            logger.warning(f"Telegraph expansion failed for {url}: {e}")
 
 
 def _build_caption(text: str, source_url: str) -> str:
