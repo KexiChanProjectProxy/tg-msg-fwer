@@ -352,11 +352,17 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 buf = io.BytesIO()
                 await bot.download_media(fwd_message, file=buf)
                 buf.seek(0)
+                # Set a filename so Telethon can infer MIME type from extension
                 if hasattr(fwd_message.media, "document"):
                     for attr in getattr(fwd_message.media.document, "attributes", []):
                         if isinstance(attr, DocumentAttributeFilename):
                             buf.name = attr.file_name
                             break
+                if not getattr(buf, "name", None):
+                    # Fallback names by type so Telethon doesn't treat them as "unnamed"
+                    _fallback = {"photo": "photo.jpg", "video": "video.mp4",
+                                 "voice": "voice.ogg", "video_note": "video_note.mp4"}
+                    buf.name = _fallback.get(media_type, "file")
 
                 await status_msg.edit("Uploading to target channel...")
                 if media_type == "photo":
