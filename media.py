@@ -235,6 +235,11 @@ def _convert_video_sync(input_buf: io.BytesIO) -> io.BytesIO:
         out_buf.seek(0)
         return out_buf
     finally:
+        if tmp_in:
+            try:
+                os.unlink(tmp_in)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_out_path)
         except OSError:
@@ -254,13 +259,20 @@ async def ensure_faststart(input_buf: io.BytesIO) -> io.BytesIO:
 def _ensure_faststart_sync(input_buf: io.BytesIO) -> io.BytesIO:
     input_data = input_buf.read()
 
+    tmp_in = None
     with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_out:
         tmp_out_path = tmp_out.name
 
     try:
+        # Write input to a temp file so ffmpeg can seek to find the moov atom,
+        # which is typically at the end of the file and unreachable via pipe.
+        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+            f.write(input_data)
+            tmp_in = f.name
+
         cmd = [
             "ffmpeg", "-y",
-            "-i", "pipe:0",
+            "-i", tmp_in,
             "-c", "copy",
             "-movflags", "+faststart",
             "-f", "mp4",
@@ -268,7 +280,6 @@ def _ensure_faststart_sync(input_buf: io.BytesIO) -> io.BytesIO:
         ]
         result = subprocess.run(
             cmd,
-            input=input_data,
             capture_output=True,
             timeout=300,
         )
@@ -287,6 +298,11 @@ def _ensure_faststart_sync(input_buf: io.BytesIO) -> io.BytesIO:
         out_buf.seek(0)
         return out_buf
     finally:
+        if tmp_in:
+            try:
+                os.unlink(tmp_in)
+            except OSError:
+                pass
         try:
             os.unlink(tmp_out_path)
         except OSError:
