@@ -1,6 +1,11 @@
 import asyncio
 import io
 import logging
+import os
+import shutil
+import uuid
+from dataclasses import dataclass
+from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from telethon import TelegramClient, utils as tl_utils
@@ -15,7 +20,10 @@ from telethon.tl.types import (
 
 import database as db_module
 import config
-from media import get_media_type, needs_video_conversion, convert_video, ensure_faststart, probe_extension
+from media import (
+    get_media_type, needs_video_conversion, convert_video, ensure_faststart,
+    probe_extension, guess_extension_from_file, probe_extension_file,
+)
 from telegraph import find_telegraph_urls, fetch_telegraph_page, download_telegraph_images
 from utils import build_message_url, retry_on_flood, rate_limit_sleep, make_upload_progress_cb
 
@@ -23,6 +31,17 @@ logger = logging.getLogger(__name__)
 
 # File size limit: 2 GB non-premium, 4 GB premium
 _MAX_FILE_SIZE = 4 * 1024 ** 3 if config.IS_PREMIUM else 2 * 1024 ** 3
+
+
+@dataclass
+class _MediaFile:
+    """Wraps an on-disk temp file.  Call cleanup() when done to delete it."""
+    path: Path
+    owned: bool = True   # False for cache-hit paths we must NOT delete
+
+    def cleanup(self) -> None:
+        if self.owned:
+            self.path.unlink(missing_ok=True)
 
 
 async def resolve_chat(userbot: TelegramClient, chat_ref: str):
@@ -123,95 +142,67 @@ async def transfer_one_message(
         return None
 
     media_type = get_media_type(message)
+    mf = await _download_to_file(userbot, message, cache)
+    if mf is None:
+        return None
 
-    if media_type == "photo":
-        buf = await _download_to_bytes(userbot, message, cache)
-        if buf is None:
-            return None
-        sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            formatting_entities=message.entities,
-            force_document=False,
-            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
-        )
+    try:
+        pcb = make_upload_progress_cb(f"msg {message.id}", logger)
 
-    elif media_type == "video":
-        buf = await _download_to_bytes(userbot, message, cache)
-        if buf is None:
-            return None
-        if needs_video_conversion(message):
-            logger.info(f"Converting non-H.264 video for message {message.id}")
-            buf = await convert_video(buf)
+        if media_type == "photo":
+            sent = await userbot.send_file(
+                target_chat, file=mf.path, caption=caption,
+                formatting_entities=message.entities,
+                force_document=False, progress_callback=pcb,
+            )
+
+        elif media_type == "video":
+            if needs_video_conversion(message):
+                logger.info(f"Converting non-H.264 video for message {message.id}")
+                mf.path = await convert_video(mf.path)
+            else:
+                mf.path = await ensure_faststart(mf.path)
+            video_attr = _get_video_attr(message)
+            duration = getattr(video_attr, "duration", 0) or 0
+            w = getattr(video_attr, "w", 0) or 0
+            h = getattr(video_attr, "h", 0) or 0
+            sent = await userbot.send_file(
+                target_chat, file=mf.path, caption=caption,
+                formatting_entities=message.entities,
+                force_document=False,
+                attributes=[DocumentAttributeVideo(
+                    duration=duration, w=w, h=h, supports_streaming=True
+                )],
+                progress_callback=pcb,
+            )
+
+        elif media_type == "voice":
+            sent = await userbot.send_file(
+                target_chat, file=mf.path, caption=caption,
+                formatting_entities=message.entities,
+                voice_note=True, progress_callback=pcb,
+            )
+
+        elif media_type == "video_note":
+            sent = await userbot.send_file(
+                target_chat, file=mf.path, caption=caption,
+                video_note=True, progress_callback=pcb,
+            )
+
+        elif media_type == "animation":
+            sent = await userbot.send_file(
+                target_chat, file=mf.path, caption=caption,
+                formatting_entities=message.entities, progress_callback=pcb,
+            )
+
         else:
-            buf = await ensure_faststart(buf)
-        video_attr = _get_video_attr(message)
-        duration = getattr(video_attr, "duration", 0) or 0
-        w = getattr(video_attr, "w", 0) or 0
-        h = getattr(video_attr, "h", 0) or 0
-        sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            formatting_entities=message.entities,
-            force_document=False,
-            attributes=[DocumentAttributeVideo(
-                duration=duration, w=w, h=h, supports_streaming=True
-            )],
-            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
-        )
-
-    elif media_type == "voice":
-        buf = await _download_to_bytes(userbot, message, cache)
-        if buf is None:
-            return None
-        sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            formatting_entities=message.entities,
-            voice_note=True,
-            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
-        )
-
-    elif media_type == "video_note":
-        buf = await _download_to_bytes(userbot, message, cache)
-        if buf is None:
-            return None
-        sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            video_note=True,
-            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
-        )
-
-    elif media_type == "animation":
-        buf = await _download_to_bytes(userbot, message, cache)
-        if buf is None:
-            return None
-        sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            formatting_entities=message.entities,
-            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
-        )
-
-    else:
-        # Generic document (stickers, files, etc.)
-        buf = await _download_to_bytes(userbot, message, cache)
-        if buf is None:
-            return None
-        sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            formatting_entities=message.entities,
-            force_document=True,
-            progress_callback=make_upload_progress_cb(f"msg {message.id}", logger),
-        )
+            sent = await userbot.send_file(
+                target_chat, file=mf.path, caption=caption,
+                formatting_entities=message.entities,
+                force_document=True, progress_callback=pcb,
+            )
+    finally:
+        mf.cleanup()
 
     await _expand_telegraph(userbot, message.message, target_chat)
     return sent
@@ -229,17 +220,14 @@ async def transfer_album(
     if not messages:
         return None
 
-    # Concurrent downloads
-    download_tasks = [
-        _download_to_bytes(userbot, msg, cache)
-        for msg in messages
-        if msg.media is not None
-    ]
+    # Concurrent downloads to disk
     media_messages = [msg for msg in messages if msg.media is not None]
+    results = await asyncio.gather(
+        *[_download_to_file(userbot, msg, cache) for msg in media_messages],
+        return_exceptions=True,
+    )
 
-    results = await asyncio.gather(*download_tasks, return_exceptions=True)
-
-    media_list: List[io.BytesIO] = []
+    mfs: List[_MediaFile] = []
     valid_messages: List[Message] = []
     for msg, result in zip(media_messages, results):
         if isinstance(result, Exception):
@@ -247,10 +235,10 @@ async def transfer_album(
             continue
         if result is None:
             continue
-        media_list.append(result)
+        mfs.append(result)
         valid_messages.append(msg)
 
-    if not media_list:
+    if not mfs:
         return None
 
     captions = []
@@ -261,12 +249,16 @@ async def transfer_album(
             captions.append(msg.message or "")
 
     first_id = messages[0].id
-    sent = await userbot.send_file(
-        target_chat,
-        file=media_list,
-        caption=captions,
-        progress_callback=make_upload_progress_cb(f"album msg {first_id}", logger),
-    )
+    try:
+        sent = await userbot.send_file(
+            target_chat,
+            file=[mf.path for mf in mfs],
+            caption=captions,
+            progress_callback=make_upload_progress_cb(f"album msg {first_id}", logger),
+        )
+    finally:
+        for mf in mfs:
+            mf.cleanup()
     return sent if isinstance(sent, list) else [sent]
 
 
@@ -340,7 +332,7 @@ async def transfer_bulk(
             download_tasks = []
             for msg, _ in pending_singles:
                 if msg.media and not isinstance(msg.media, MessageMediaPoll):
-                    download_tasks.append((msg, _download_to_bytes(userbot, msg)))
+                    download_tasks.append((msg, _download_to_file(userbot, msg)))
                 else:
                     download_tasks.append((msg, None))
 
@@ -355,10 +347,10 @@ async def transfer_bulk(
                     res = next(result_iter)
                     if isinstance(res, Exception):
                         logger.error(f"Download failed for msg {msg.id}: {res}")
-                        buf = None
+                        mf = None
                     else:
-                        buf = res
-                    await queue.put(("single", msg, buf, src_url))
+                        mf = res
+                    await queue.put(("single", msg, mf, src_url))
             pending_singles.clear()
 
         try:
@@ -392,27 +384,25 @@ async def transfer_bulk(
                         await queue.put(("error", message.id, None, None))
                         continue
 
-                    # Download concurrently
-                    download_tasks = [
-                        _download_to_bytes(userbot, m)
-                        for m in album_messages
-                        if m.media is not None
-                    ]
+                    # Download concurrently to disk
                     media_msgs = [m for m in album_messages if m.media is not None]
-                    if download_tasks:
-                        results = await asyncio.gather(*download_tasks, return_exceptions=True)
+                    if media_msgs:
+                        results = await asyncio.gather(
+                            *[_download_to_file(userbot, m) for m in media_msgs],
+                            return_exceptions=True,
+                        )
                     else:
                         results = []
-                    bufs = []
+                    mfs = []
                     valid_msgs = []
                     for m, res in zip(media_msgs, results):
                         if isinstance(res, Exception):
                             logger.error(f"Album download failed for msg {m.id}: {res}")
                         elif res is not None:
-                            bufs.append(res)
+                            mfs.append(res)
                             valid_msgs.append(m)
 
-                    await queue.put(("album", album_messages, valid_msgs, bufs, source_url))
+                    await queue.put(("album", album_messages, valid_msgs, mfs, source_url))
                 else:
                     # Size guard before batching
                     if message.media and not isinstance(message.media, MessageMediaPoll):
@@ -449,9 +439,9 @@ async def transfer_bulk(
                 continue
 
             if kind == "album":
-                _, album_messages, valid_msgs, bufs, source_url = item
+                _, album_messages, valid_msgs, mfs, source_url = item
                 try:
-                    if bufs:
+                    if mfs:
                         captions = []
                         for i, msg in enumerate(valid_msgs):
                             if i == len(valid_msgs) - 1:
@@ -459,7 +449,7 @@ async def transfer_bulk(
                             else:
                                 captions.append(msg.message or "")
                         sent = await userbot.send_file(
-                            target_chat, file=bufs, caption=captions,
+                            target_chat, file=[mf.path for mf in mfs], caption=captions,
                             progress_callback=make_upload_progress_cb(
                                 f"album msg {album_messages[0].id}", logger
                             ),
@@ -474,11 +464,14 @@ async def transfer_bulk(
                 except Exception as e:
                     logger.error(f"Failed to upload album starting at msg {album_messages[0].id}: {e}")
                     failed_ids.append(album_messages[0].id)
+                finally:
+                    for mf in (mfs or []):
+                        mf.cleanup()
 
             elif kind == "single":
-                _, message, buf, source_url = item
+                _, message, mf, source_url = item
                 try:
-                    sent = await _upload_prepared(userbot, message, buf, target_chat, source_url)
+                    sent = await _upload_prepared(userbot, message, mf, target_chat, source_url)
                     if sent:
                         target_id = sent.id if not isinstance(sent, list) else None
                         pending_records.append((job_id, message.id, target_id))
@@ -487,6 +480,9 @@ async def transfer_bulk(
                 except Exception as e:
                     logger.error(f"Failed to upload msg {message.id}: {e}")
                     failed_ids.append(message.id)
+                finally:
+                    if mf:
+                        mf.cleanup()
 
             queue.task_done()
 
@@ -519,11 +515,14 @@ async def transfer_bulk(
 async def _upload_prepared(
     userbot: TelegramClient,
     message: Message,
-    buf: Optional[io.BytesIO],
+    mf: Optional[_MediaFile],
     target_chat,
     source_url: str,
 ) -> Optional[Message]:
-    """Upload a single message given a pre-downloaded buffer (or None for text-only)."""
+    """Upload a single message given a pre-downloaded _MediaFile (or None for text-only).
+
+    Does NOT call mf.cleanup() — the caller (consumer) is responsible for that.
+    """
     if message.action:
         return None
     if isinstance(message.media, MessageMediaPoll):
@@ -531,7 +530,7 @@ async def _upload_prepared(
 
     caption = _build_caption(message.message or "", source_url)
 
-    if buf is None:
+    if mf is None:
         sent = await userbot.send_message(
             target_chat,
             message=caption,
@@ -541,33 +540,27 @@ async def _upload_prepared(
         return sent
 
     media_type = get_media_type(message)
-
     progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
 
     if media_type == "photo":
         sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
+            target_chat, file=mf.path, caption=caption,
             formatting_entities=message.entities,
-            force_document=False,
-            progress_callback=progress_cb,
+            force_document=False, progress_callback=progress_cb,
         )
 
     elif media_type == "video":
         if needs_video_conversion(message):
             logger.info(f"Converting non-H.264 video for message {message.id}")
-            buf = await convert_video(buf)
+            mf.path = await convert_video(mf.path)
         else:
-            buf = await ensure_faststart(buf)
+            mf.path = await ensure_faststart(mf.path)
         video_attr = _get_video_attr(message)
         duration = getattr(video_attr, "duration", 0) or 0
         w = getattr(video_attr, "w", 0) or 0
         h = getattr(video_attr, "h", 0) or 0
         sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
+            target_chat, file=mf.path, caption=caption,
             formatting_entities=message.entities,
             force_document=False,
             attributes=[DocumentAttributeVideo(
@@ -578,40 +571,28 @@ async def _upload_prepared(
 
     elif media_type == "voice":
         sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
+            target_chat, file=mf.path, caption=caption,
             formatting_entities=message.entities,
-            voice_note=True,
-            progress_callback=progress_cb,
+            voice_note=True, progress_callback=progress_cb,
         )
 
     elif media_type == "video_note":
         sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            video_note=True,
-            progress_callback=progress_cb,
+            target_chat, file=mf.path, caption=caption,
+            video_note=True, progress_callback=progress_cb,
         )
 
     elif media_type == "animation":
         sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
-            formatting_entities=message.entities,
-            progress_callback=progress_cb,
+            target_chat, file=mf.path, caption=caption,
+            formatting_entities=message.entities, progress_callback=progress_cb,
         )
 
     else:
         sent = await userbot.send_file(
-            target_chat,
-            file=buf,
-            caption=caption,
+            target_chat, file=mf.path, caption=caption,
             formatting_entities=message.entities,
-            force_document=True,
-            progress_callback=progress_cb,
+            force_document=True, progress_callback=progress_cb,
         )
 
     await _expand_telegraph(userbot, message.message, target_chat)
@@ -692,42 +673,60 @@ def _get_file_unique_id(message: Message) -> Optional[str]:
     return None
 
 
-async def _download_to_bytes(userbot: TelegramClient, message: Message, cache=None) -> Optional[io.BytesIO]:
-    """Download message media into a BytesIO buffer, using cache when available."""
+def _get_doc_ext(message: Message) -> str:
+    """Return the file extension from DocumentAttributeFilename, or empty string."""
+    if hasattr(message.media, "document"):
+        for attr in getattr(message.media.document, "attributes", []):
+            if isinstance(attr, DocumentAttributeFilename):
+                name = attr.file_name
+                if "." in name:
+                    return name.rsplit(".", 1)[1].lower()
+    return ""
+
+
+async def _download_to_file(
+    userbot: TelegramClient, message: Message, cache=None
+) -> Optional[_MediaFile]:
+    """
+    Download message media to a temp file in config.TEMP_DIR (real disk, not tmpfs).
+
+    Returns a _MediaFile whose path has the correct extension for MIME detection.
+    Caller must call .cleanup() when done to delete the temp file.
+    Returns None on failure.
+    """
+    config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     file_id = _get_file_unique_id(message)
 
+    # --- Cache hit: hardlink into TEMP_DIR with correct extension ---
     if cache and file_id:
         cached_path = cache.get(file_id)
         if cached_path:
-            buf = io.BytesIO(cached_path.read_bytes())
-            # Re-attach filename hint
-            if hasattr(message.media, "document"):
-                for attr in getattr(message.media.document, "attributes", []):
-                    if isinstance(attr, DocumentAttributeFilename):
-                        buf.name = attr.file_name
-                        break
-            return buf
+            ext = _get_doc_ext(message) or guess_extension_from_file(cached_path)
+            link = config.TEMP_DIR / f"dl_{uuid.uuid4().hex}.{ext}"
+            try:
+                os.link(cached_path, link)
+            except OSError:
+                shutil.copy2(cached_path, link)
+            return _MediaFile(link, owned=True)
 
+    # --- Fresh download to TEMP_DIR ---
+    tmp = config.TEMP_DIR / f"dl_{message.id}_{uuid.uuid4().hex}.bin"
     try:
-        buf = io.BytesIO()
-        await userbot.download_media(message, file=buf)
-        buf.seek(0)
-        # Attach filename hint so Telethon picks the right MIME type on re-upload
-        if hasattr(message.media, "document"):
-            for attr in getattr(message.media.document, "attributes", []):
-                if isinstance(attr, DocumentAttributeFilename):
-                    buf.name = attr.file_name
-                    break
-        # For photos and docs without a filename, detect from magic bytes then ffprobe
-        if not getattr(buf, "name", None):
-            ext = await probe_extension(buf)
-            buf.name = f"file.{ext}"
+        await userbot.download_media(message, file=str(tmp))
+
+        ext = _get_doc_ext(message)
+        if not ext:
+            ext = await probe_extension_file(tmp)
+
+        final = tmp.with_name(f"{tmp.stem}.{ext}")
+        tmp.rename(final)
 
         if cache and file_id:
-            await cache.put(file_id, buf.getvalue())
-            buf.seek(0)
+            await cache.put_file(file_id, final)
 
-        return buf
+        return _MediaFile(final, owned=True)
+
     except Exception as e:
         logger.error(f"Failed to download media for message {message.id}: {e}")
+        tmp.unlink(missing_ok=True)
         return None

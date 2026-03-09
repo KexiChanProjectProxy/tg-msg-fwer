@@ -7,6 +7,8 @@ import logging
 import os
 import subprocess
 import tempfile
+import uuid
+from pathlib import Path
 
 from telethon.tl.types import (
     MessageMediaPhoto,
@@ -104,6 +106,48 @@ def guess_extension_from_bytes(buf: io.BytesIO) -> str:
     return "bin"
 
 
+def guess_extension_from_file(path: Path) -> str:
+    """Read the first 12 bytes of *path* and return an extension via magic bytes."""
+    try:
+        with open(path, "rb") as f:
+            header = f.read(12)
+        return guess_extension_from_bytes(io.BytesIO(header))
+    except OSError:
+        return "bin"
+
+
+async def probe_extension_file(path: Path) -> str:
+    """Detect extension for an on-disk file: magic bytes first, then ffprobe on path."""
+    ext = guess_extension_from_file(path)
+    if ext != "bin":
+        return ext
+    loop = asyncio.get_event_loop()
+    return await loop.run_in_executor(None, _probe_file_sync, path)
+
+
+def _probe_file_sync(path: Path) -> str:
+    _FORMAT_TO_EXT = {
+        "mjpeg": "jpg", "jpeg_pipe": "jpg", "png_pipe": "png", "gif": "gif",
+        "webp_pipe": "webp", "mp4": "mp4", "mov,mp4,m4a,3gp,3g2,mj2": "mp4",
+        "matroska,webm": "mkv", "ogg": "ogg", "mp3": "mp3",
+        "wav": "wav", "flac": "flac", "aac": "aac",
+    }
+    try:
+        result = subprocess.run(
+            ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", str(path)],
+            capture_output=True, timeout=30,
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            fmt_name = info.get("format", {}).get("format_name", "")
+            for key, ext in _FORMAT_TO_EXT.items():
+                if key == fmt_name or key in fmt_name or fmt_name in key:
+                    return ext
+    except Exception as e:
+        logger.warning(f"ffprobe format detection failed: {e}")
+    return "bin"
+
+
 async def probe_extension(buf: io.BytesIO) -> str:
     """
     Detect the file format of *buf*, trying magic bytes first, then ffprobe.
@@ -183,27 +227,24 @@ def needs_video_conversion(message) -> bool:
     return mime.startswith("video/")
 
 
-async def convert_video(input_buf: io.BytesIO) -> io.BytesIO:
+async def convert_video(path: Path) -> Path:
     """
-    Convert video to Telegram-compatible H.264/AAC MP4 via ffmpeg.
+    Convert an on-disk video file to Telegram-compatible H.264/AAC MP4 via ffmpeg.
 
-    Uses a temp file for output because -movflags +faststart requires seekable output.
+    Deletes *path* on success and returns the new output path.
+    Raises RuntimeError if ffmpeg fails (caller should clean up *path*).
     Runs in a thread executor to avoid blocking the event loop.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _convert_video_sync, input_buf)
+    return await loop.run_in_executor(None, _convert_video_sync, path)
 
 
-def _convert_video_sync(input_buf: io.BytesIO) -> io.BytesIO:
-    input_data = input_buf.read()
-
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_out:
-        tmp_out_path = tmp_out.name
-
+def _convert_video_sync(path: Path) -> Path:
+    out_path = path.parent / f"cv_{uuid.uuid4().hex}.mp4"
     try:
         cmd = [
             "ffmpeg", "-y",
-            "-i", "pipe:0",
+            "-i", str(path),
             "-c:v", "libx264",
             "-profile:v", "high",
             "-level", "4.0",
@@ -215,95 +256,58 @@ def _convert_video_sync(input_buf: io.BytesIO) -> io.BytesIO:
             "-b:a", "128k",
             "-ac", "2",
             "-f", "mp4",
-            tmp_out_path,
+            str(out_path),
         ]
-        result = subprocess.run(
-            cmd,
-            input=input_data,
-            capture_output=True,
-            timeout=600,
-        )
+        result = subprocess.run(cmd, capture_output=True, timeout=600)
         if result.returncode != 0:
             raise RuntimeError(
                 f"ffmpeg conversion failed (exit {result.returncode}): "
                 f"{result.stderr.decode(errors='replace')[-500:]}"
             )
-
-        with open(tmp_out_path, "rb") as f:
-            out_buf = io.BytesIO(f.read())
-        out_buf.name = "video.mp4"
-        out_buf.seek(0)
-        return out_buf
-    finally:
-        if tmp_in:
-            try:
-                os.unlink(tmp_in)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp_out_path)
-        except OSError:
-            pass
+        path.unlink(missing_ok=True)
+        return out_path
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
 
 
-async def ensure_faststart(input_buf: io.BytesIO) -> io.BytesIO:
+async def ensure_faststart(path: Path) -> Path:
     """
-    Re-mux an MP4 to move the moov atom to the start (faststart) without re-encoding.
+    Re-mux an on-disk MP4 to move the moov atom to the start without re-encoding.
 
+    Deletes *path* on success and returns the new output path.
+    Returns *path* unchanged (non-fatal) if ffmpeg fails.
     Runs in a thread executor to avoid blocking the event loop.
     """
     loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _ensure_faststart_sync, input_buf)
+    return await loop.run_in_executor(None, _ensure_faststart_sync, path)
 
 
-def _ensure_faststart_sync(input_buf: io.BytesIO) -> io.BytesIO:
-    input_data = input_buf.read()
-
-    tmp_in = None
-    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as tmp_out:
-        tmp_out_path = tmp_out.name
-
+def _ensure_faststart_sync(path: Path) -> Path:
+    out_path = path.parent / f"fs_{uuid.uuid4().hex}.mp4"
     try:
-        # Write input to a temp file so ffmpeg can seek to find the moov atom,
-        # which is typically at the end of the file and unreachable via pipe.
-        with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
-            f.write(input_data)
-            tmp_in = f.name
-
         cmd = [
             "ffmpeg", "-y",
-            "-i", tmp_in,
+            "-i", str(path),
             "-c", "copy",
             "-movflags", "+faststart",
             "-f", "mp4",
-            tmp_out_path,
+            str(out_path),
         ]
-        result = subprocess.run(
-            cmd,
-            capture_output=True,
-            timeout=300,
-        )
+        result = subprocess.run(cmd, capture_output=True, timeout=300)
         if result.returncode != 0:
-            # Non-fatal: return original buffer
             logger.warning(
                 f"ensure_faststart failed (exit {result.returncode}), using original: "
                 f"{result.stderr.decode(errors='replace')[-200:]}"
             )
-            input_buf.seek(0)
-            return input_buf
+            out_path.unlink(missing_ok=True)
+            return path  # caller keeps original
 
-        with open(tmp_out_path, "rb") as f:
-            out_buf = io.BytesIO(f.read())
-        out_buf.name = "video.mp4"
-        out_buf.seek(0)
-        return out_buf
-    finally:
-        if tmp_in:
-            try:
-                os.unlink(tmp_in)
-            except OSError:
-                pass
-        try:
-            os.unlink(tmp_out_path)
-        except OSError:
-            pass
+        path.unlink(missing_ok=True)
+        return out_path
+    except Exception as e:
+        logger.warning(f"ensure_faststart exception: {e}, using original")
+        out_path.unlink(missing_ok=True)
+        return path
+
+

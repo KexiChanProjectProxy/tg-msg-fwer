@@ -1,6 +1,7 @@
 import asyncio
 import logging
 import os
+import shutil
 from pathlib import Path
 from typing import Optional
 
@@ -38,6 +39,19 @@ class FileCache:
         async with self._lock:
             path.write_bytes(data)
             logger.debug(f"Cache put: {file_unique_id} ({len(data)} bytes)")
+            if self._current_size() > self._max:
+                self._evict()
+        return path
+
+    async def put_file(self, file_unique_id: str, src: Path) -> Path:
+        """Link or copy *src* into the cache without loading it into RAM."""
+        path = self._dir / file_unique_id
+        async with self._lock:
+            try:
+                os.link(src, path)
+            except OSError:
+                shutil.copy2(src, path)
+            logger.debug(f"Cache put_file: {file_unique_id} ({path.stat().st_size} bytes)")
             if self._current_size() > self._max:
                 self._evict()
         return path
