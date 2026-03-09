@@ -9,7 +9,7 @@ from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo,
 
 import config
 import database as db_module
-from media import get_media_type
+from media import get_media_type, probe_extension
 from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk, transfer_bulk_files
 from utils import build_message_url
 
@@ -359,10 +359,8 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                             buf.name = attr.file_name
                             break
                 if not getattr(buf, "name", None):
-                    # Fallback names by type so Telethon doesn't treat them as "unnamed"
-                    _fallback = {"photo": "photo.jpg", "video": "video.mp4",
-                                 "voice": "voice.ogg", "video_note": "video_note.mp4"}
-                    buf.name = _fallback.get(media_type, "file")
+                    ext = await probe_extension(buf)
+                    buf.name = f"file.{ext}"
 
                 await status_msg.edit("Uploading to target channel...")
                 if media_type == "photo":

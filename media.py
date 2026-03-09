@@ -2,6 +2,7 @@
 
 import asyncio
 import io
+import json
 import logging
 import os
 import subprocess
@@ -65,6 +66,59 @@ def get_media_type(message) -> str:
         return "document"
 
     return "document"
+
+
+async def probe_extension(buf: io.BytesIO) -> str:
+    """
+    Use ffprobe to detect the format of *buf* and return a matching file extension.
+
+    The buffer position is restored to 0 after probing.
+    Returns a bare extension string without a dot, e.g. ``"jpg"``, ``"mp4"``.
+    Falls back to ``"bin"`` if detection fails.
+    """
+    loop = asyncio.get_event_loop()
+    ext = await loop.run_in_executor(None, _probe_extension_sync, buf.read())
+    buf.seek(0)
+    return ext
+
+
+def _probe_extension_sync(data: bytes) -> str:
+    _FORMAT_TO_EXT = {
+        "mjpeg": "jpg",
+        "jpeg_pipe": "jpg",
+        "png_pipe": "png",
+        "gif": "gif",
+        "webp_pipe": "webp",
+        "mp4": "mp4",
+        "mov,mp4,m4a,3gp,3g2,mj2": "mp4",
+        "matroska,webm": "mkv",
+        "ogg": "ogg",
+        "mp3": "mp3",
+        "wav": "wav",
+        "flac": "flac",
+        "aac": "aac",
+    }
+    try:
+        result = subprocess.run(
+            [
+                "ffprobe", "-v", "quiet",
+                "-print_format", "json",
+                "-show_format",
+                "-",
+            ],
+            input=data,
+            capture_output=True,
+            timeout=30,
+        )
+        if result.returncode == 0:
+            info = json.loads(result.stdout)
+            fmt_name = info.get("format", {}).get("format_name", "")
+            for key, ext in _FORMAT_TO_EXT.items():
+                if key == fmt_name or key in fmt_name or fmt_name in key:
+                    return ext
+    except Exception as e:
+        logger.warning(f"ffprobe format detection failed: {e}")
+    return "bin"
 
 
 def needs_video_conversion(message) -> bool:
