@@ -316,6 +316,37 @@ async def transfer_bulk(
 
     async def _producer():
         """Iterate messages, skip already-done ones, download media, enqueue."""
+        pending_singles: List[Tuple[Message, str]] = []
+
+        async def _flush_singles():
+            """Download a batch of single messages concurrently, enqueue results."""
+            if not pending_singles:
+                return
+            # Build (msg, coro_or_None) pairs
+            download_tasks = []
+            for msg, _ in pending_singles:
+                if msg.media and not isinstance(msg.media, MessageMediaPoll):
+                    download_tasks.append((msg, _download_to_bytes(userbot, msg)))
+                else:
+                    download_tasks.append((msg, None))
+
+            coros = [coro for _, coro in download_tasks if coro is not None]
+            results = await asyncio.gather(*coros, return_exceptions=True) if coros else []
+
+            result_iter = iter(results)
+            for (msg, coro), (_, src_url) in zip(download_tasks, pending_singles):
+                if coro is None:
+                    await queue.put(("single", msg, None, src_url))
+                else:
+                    res = next(result_iter)
+                    if isinstance(res, Exception):
+                        logger.error(f"Download failed for msg {msg.id}: {res}")
+                        buf = None
+                    else:
+                        buf = res
+                    await queue.put(("single", msg, buf, src_url))
+            pending_singles.clear()
+
         try:
             async for message in userbot.iter_messages(source_chat, reverse=True):
                 if cancel_event.is_set():
@@ -335,6 +366,10 @@ async def transfer_bulk(
                     if message.grouped_id in seen_groups:
                         continue
                     seen_groups.add(message.grouped_id)
+
+                    # Flush any pending singles before the album to preserve order
+                    await _flush_singles()
+
                     # Resolve album members (may include already-transferred ones)
                     try:
                         album_messages = await resolve_message(userbot, source_chat, message.id)
@@ -365,19 +400,23 @@ async def transfer_bulk(
 
                     await queue.put(("album", album_messages, valid_msgs, bufs, source_url))
                 else:
-                    # Single message: download media if any
-                    buf = None
+                    # Size guard before batching
                     if message.media and not isinstance(message.media, MessageMediaPoll):
                         file_size = _get_file_size(message)
                         if file_size and file_size > _MAX_FILE_SIZE:
                             logger.warning(
                                 f"Skipping msg {message.id}: {file_size / 1024**2:.1f} MB > limit"
                             )
+                            await _flush_singles()
                             await queue.put(("skip", message.id))
                             continue
-                        buf = await _download_to_bytes(userbot, message)
-                    await queue.put(("single", message, buf, source_url))
+
+                    # Accumulate into batch; flush when batch is full
+                    pending_singles.append((message, source_url))
+                    if len(pending_singles) >= cfg.CONCURRENT_TRANSFERS:
+                        await _flush_singles()
         finally:
+            await _flush_singles()
             await queue.put(None)  # sentinel
 
     async def _consumer():

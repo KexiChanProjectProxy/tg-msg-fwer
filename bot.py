@@ -5,10 +5,11 @@ from typing import Dict, Optional, Tuple
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Button
-from telethon.tl.types import Message
+from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo, Message
 
 import config
 import database as db_module
+from media import get_media_type
 from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk, transfer_bulk_files
 from utils import build_message_url
 
@@ -347,18 +348,39 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
                 # Direct download from the bot's copy of the forwarded message
                 await status_msg.edit("Downloading media...")
+                media_type = get_media_type(fwd_message)
                 buf = io.BytesIO()
                 await bot.download_media(fwd_message, file=buf)
                 buf.seek(0)
                 if hasattr(fwd_message.media, "document"):
-                    from telethon.tl.types import DocumentAttributeFilename
                     for attr in getattr(fwd_message.media.document, "attributes", []):
                         if isinstance(attr, DocumentAttributeFilename):
                             buf.name = attr.file_name
                             break
 
                 await status_msg.edit("Uploading to target channel...")
-                await userbot.send_file(target_chat, file=buf)
+                if media_type == "photo":
+                    await userbot.send_file(target_chat, file=buf, force_document=False)
+                elif media_type == "video":
+                    video_attr = None
+                    if hasattr(fwd_message.media, "document"):
+                        for attr in getattr(fwd_message.media.document, "attributes", []):
+                            if isinstance(attr, DocumentAttributeVideo):
+                                video_attr = attr
+                                break
+                    duration = getattr(video_attr, "duration", 0) or 0
+                    w = getattr(video_attr, "w", 0) or 0
+                    h = getattr(video_attr, "h", 0) or 0
+                    await userbot.send_file(
+                        target_chat, file=buf, force_document=False,
+                        attributes=[DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
+                    )
+                elif media_type == "voice":
+                    await userbot.send_file(target_chat, file=buf, voice_note=True)
+                elif media_type == "video_note":
+                    await userbot.send_file(target_chat, file=buf, video_note=True)
+                else:
+                    await userbot.send_file(target_chat, file=buf, force_document=True)
                 pending_forwards.pop(sender_id, None)
                 await status_msg.edit("Done!")
 
