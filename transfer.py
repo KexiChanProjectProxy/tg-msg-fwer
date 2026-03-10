@@ -328,7 +328,7 @@ async def transfer_bulk(
     pending_records: List[Tuple[int, int, Optional[int]]] = []
     last_activity = [time.monotonic()]  # updated by download/upload progress; watchdog uses this
 
-    def _touch():
+    def _touch(current=None, total=None):
         last_activity[0] = time.monotonic()
 
     def _make_progress_cb(label: str):
