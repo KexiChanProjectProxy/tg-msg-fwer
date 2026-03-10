@@ -3,6 +3,7 @@ import io
 import logging
 import os
 import shutil
+import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
@@ -325,6 +326,18 @@ async def transfer_bulk(
     failed_ids: List[int] = []
     seen_groups: Set[int] = set()
     pending_records: List[Tuple[int, int, Optional[int]]] = []
+    last_activity = [time.monotonic()]  # updated by download/upload progress; watchdog uses this
+
+    def _touch():
+        last_activity[0] = time.monotonic()
+
+    def _make_progress_cb(label: str):
+        """Upload progress callback that updates last_activity and logs every 10%."""
+        base = make_upload_progress_cb(label, logger)
+        def cb(current, total):
+            _touch()
+            base(current, total)
+        return cb
 
     async def _flush_records():
         nonlocal pending_records
@@ -344,7 +357,7 @@ async def transfer_bulk(
             download_tasks = []
             for msg, _ in pending_singles:
                 if msg.media and not isinstance(msg.media, MessageMediaPoll):
-                    download_tasks.append((msg, _download_to_file(userbot, msg)))
+                    download_tasks.append((msg, _download_to_file(userbot, msg, on_progress=_touch)))
                 else:
                     download_tasks.append((msg, None))
 
@@ -369,6 +382,7 @@ async def transfer_bulk(
             async for message in _iter_with_timeout(
                 userbot.iter_messages(source_chat, reverse=True), config.ITER_TIMEOUT
             ):
+                _touch()
                 if cancel_event.is_set():
                     break
                 if message.action:
@@ -402,7 +416,7 @@ async def transfer_bulk(
                     media_msgs = [m for m in album_messages if m.media is not None]
                     if media_msgs:
                         results = await asyncio.gather(
-                            *[_download_to_file(userbot, m) for m in media_msgs],
+                            *[_download_to_file(userbot, m, on_progress=_touch) for m in media_msgs],
                             return_exceptions=True,
                         )
                     else:
@@ -465,8 +479,8 @@ async def transfer_bulk(
                         sent = await asyncio.wait_for(
                             userbot.send_file(
                                 target_chat, file=[mf.path for mf in mfs], caption=captions,
-                                progress_callback=make_upload_progress_cb(
-                                    f"album msg {album_messages[0].id}", logger
+                                progress_callback=_make_progress_cb(
+                                    f"album msg {album_messages[0].id}"
                                 ),
                             ),
                             timeout=config.OPERATION_TIMEOUT,
@@ -489,7 +503,10 @@ async def transfer_bulk(
                 _, message, mf, source_url = item
                 try:
                     sent = await asyncio.wait_for(
-                        _upload_prepared(userbot, message, mf, target_chat, source_url),
+                        _upload_prepared(
+                            userbot, message, mf, target_chat, source_url,
+                            progress_cb=_make_progress_cb(f"msg {message.id}"),
+                        ),
                         timeout=config.OPERATION_TIMEOUT,
                     )
                     if sent:
@@ -524,8 +541,6 @@ async def transfer_bulk(
     stuck_timeout = int(getattr(cfg, "STUCK_TIMEOUT", 600))  # seconds, default 10 min
 
     async def _watchdog():
-        last_transferred = transferred
-        elapsed = 0
         while True:
             await asyncio.sleep(15)
             if producer_task.done() and consumer_task.done():
@@ -538,18 +553,14 @@ async def transfer_bulk(
                 if not consumer_task.done():
                     consumer_task.cancel()
                 return
-            if transferred > last_transferred:
-                last_transferred = transferred
-                elapsed = 0
-            else:
-                elapsed += 15
-                if elapsed >= stuck_timeout:
-                    logger.error(
-                        f"Job {job_id} stuck for {elapsed}s with no progress — force-cancelling tasks"
-                    )
-                    producer_task.cancel()
-                    consumer_task.cancel()
-                    return
+            idle = time.monotonic() - last_activity[0]
+            if idle >= stuck_timeout:
+                logger.error(
+                    f"Job {job_id} stuck for {idle:.0f}s with no I/O activity — force-cancelling tasks"
+                )
+                producer_task.cancel()
+                consumer_task.cancel()
+                return
 
     watchdog_task = asyncio.create_task(_watchdog())
     try:
@@ -573,6 +584,7 @@ async def _upload_prepared(
     mf: Optional[_MediaFile],
     target_chat,
     source_url: str,
+    progress_cb=None,
 ) -> Optional[Message]:
     """Upload a single message given a pre-downloaded _MediaFile (or None for text-only).
 
@@ -595,7 +607,8 @@ async def _upload_prepared(
         return sent
 
     media_type = get_media_type(message)
-    progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
+    if progress_cb is None:
+        progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
 
     if media_type == "photo":
         sent = await userbot.send_file(
@@ -740,7 +753,7 @@ def _get_doc_ext(message: Message) -> str:
 
 
 async def _download_to_file(
-    userbot: TelegramClient, message: Message, cache=None
+    userbot: TelegramClient, message: Message, cache=None, on_progress=None
 ) -> Optional[_MediaFile]:
     """
     Download message media to a temp file in config.TEMP_DIR (real disk, not tmpfs).
@@ -768,7 +781,7 @@ async def _download_to_file(
     tmp = config.TEMP_DIR / f"dl_{message.id}_{uuid.uuid4().hex}.bin"
     try:
         await asyncio.wait_for(
-            userbot.download_media(message, file=str(tmp)),
+            userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
             timeout=config.OPERATION_TIMEOUT,
         )
 
