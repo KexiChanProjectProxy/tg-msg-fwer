@@ -24,6 +24,7 @@ from telethon.tl.types import (
 
 import database as db_module
 import config
+from sender_pool import ByteBudget, SenderPool
 from media import (
     get_media_type, needs_video_conversion, convert_video, ensure_faststart,
     probe_extension, guess_extension_from_file, probe_extension_file,
@@ -323,7 +324,8 @@ async def transfer_bulk(
         db, _job.source_chat, _job.target_chat
     )
 
-    queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.CONCURRENT_TRANSFERS)
+    byte_budget = ByteBudget(cfg.MAX_CACHE_SIZE)
+    upload_queue: asyncio.Queue = asyncio.Queue()
 
     transferred = 0
     failed_ids: List[int] = []
@@ -349,38 +351,7 @@ async def transfer_bulk(
             pending_records = []
 
     async def _producer():
-        """Iterate messages, skip already-done ones, download media, enqueue."""
-        pending_singles: List[Tuple[Message, str]] = []
-
-        async def _flush_singles():
-            """Download a batch of single messages concurrently, enqueue results."""
-            if not pending_singles:
-                return
-            # Build (msg, coro_or_None) pairs
-            download_tasks = []
-            for msg, _ in pending_singles:
-                if msg.media and not isinstance(msg.media, MessageMediaPoll):
-                    download_tasks.append((msg, _download_to_file(userbot, msg, on_progress=_touch)))
-                else:
-                    download_tasks.append((msg, None))
-
-            coros = [coro for _, coro in download_tasks if coro is not None]
-            results = await asyncio.gather(*coros, return_exceptions=True) if coros else []
-
-            result_iter = iter(results)
-            for (msg, coro), (_, src_url) in zip(download_tasks, pending_singles):
-                if coro is None:
-                    await queue.put(("single", msg, None, src_url))
-                else:
-                    res = next(result_iter)
-                    if isinstance(res, Exception):
-                        logger.error(f"Download failed for msg {msg.id}: {res}")
-                        mf = None
-                    else:
-                        mf = res
-                    await queue.put(("single", msg, mf, src_url))
-            pending_singles.clear()
-
+        """Iterate messages, skip already-done ones, download media, enqueue individually."""
         try:
             async for message in _iter_with_timeout(
                 userbot.iter_messages(source_chat, reverse=True), config.ITER_TIMEOUT
@@ -404,19 +375,17 @@ async def transfer_bulk(
                         continue
                     seen_groups.add(message.grouped_id)
 
-                    # Flush any pending singles before the album to preserve order
-                    await _flush_singles()
-
-                    # Resolve album members (may include already-transferred ones)
                     try:
                         album_messages = await resolve_message(userbot, source_chat, message.id)
                     except Exception as e:
                         logger.error(f"Failed to resolve album at msg {message.id}: {e}")
-                        await queue.put(("error", message.id, None, None))
+                        await upload_queue.put(("error", message.id, None, None))
                         continue
 
-                    # Download concurrently to disk
                     media_msgs = [m for m in album_messages if m.media is not None]
+                    estimated_total = sum(_get_file_size(m) or 0 for m in media_msgs)
+                    await byte_budget.acquire(estimated_total)
+
                     if media_msgs:
                         results = await asyncio.gather(
                             *[_download_to_file(userbot, m, on_progress=_touch) for m in media_msgs],
@@ -433,31 +402,58 @@ async def transfer_bulk(
                             mfs.append(res)
                             valid_msgs.append(m)
 
-                    await queue.put(("album", album_messages, valid_msgs, mfs, source_url))
+                    actual_bytes = sum(mf.path.stat().st_size for mf in mfs)
+                    delta = actual_bytes - estimated_total
+                    if delta > 0:
+                        await byte_budget.acquire(delta)
+                    elif delta < 0:
+                        await byte_budget.release(-delta)
+
+                    await upload_queue.put(("album", album_messages, valid_msgs, mfs, source_url, actual_bytes))
+
                 else:
-                    # Size guard before batching
+                    # Size guard
                     if message.media and not isinstance(message.media, MessageMediaPoll):
                         file_size = _get_file_size(message)
                         if file_size and file_size > _MAX_FILE_SIZE:
                             logger.warning(
                                 f"Skipping msg {message.id}: {file_size / 1024**2:.1f} MB > limit"
                             )
-                            await _flush_singles()
-                            await queue.put(("skip", message.id))
+                            await upload_queue.put(("skip", message.id))
                             continue
+                        estimated_size = file_size or 0
+                    else:
+                        estimated_size = 0
 
-                    # Accumulate into batch; flush when batch is full
-                    pending_singles.append((message, source_url))
-                    if len(pending_singles) >= cfg.CONCURRENT_TRANSFERS:
-                        await _flush_singles()
+                    await byte_budget.acquire(estimated_size)
+
+                    if message.media and not isinstance(message.media, MessageMediaPoll):
+                        mf = await _download_to_file(userbot, message, on_progress=_touch)
+                    else:
+                        mf = None
+
+                    if mf is not None:
+                        actual_bytes = mf.path.stat().st_size
+                        delta = actual_bytes - estimated_size
+                        if delta > 0:
+                            await byte_budget.acquire(delta)
+                        elif delta < 0:
+                            await byte_budget.release(-delta)
+                        bytes_held = actual_bytes
+                    else:
+                        # Download failed or text-only — release reserved budget
+                        if estimated_size > 0:
+                            await byte_budget.release(estimated_size)
+                        bytes_held = 0
+
+                    await upload_queue.put(("single", message, mf, source_url, bytes_held))
         finally:
-            await _flush_singles()
-            await queue.put(None)  # sentinel
+            await upload_queue.put(None)  # sentinel
 
     async def _consumer():
         nonlocal transferred, pending_records
         while True:
-            item = await queue.get()
+            item = await upload_queue.get()
             if item is None:
                 break
 
@@ -466,35 +462,59 @@ async def transfer_bulk(
             if kind == "skip" or kind == "error":
                 if kind == "error":
                     failed_ids.append(item[1])
-                queue.task_done()
+                upload_queue.task_done()
                 continue
 
             if kind == "album":
-                _, album_messages, valid_msgs, mfs, source_url = item
+                _, album_messages, valid_msgs, mfs, source_url, bytes_held = item
                 try:
                     if mfs:
-                        captions = []
-                        for i, msg in enumerate(valid_msgs):
-                            if i == len(valid_msgs) - 1:
-                                captions.append(_build_caption(msg.message or "", source_url))
+                        # Pre-upload each album file via sender pool concurrently
+                        pre_handles = await asyncio.gather(*[
+                            _upload_file_parallel(
+                                userbot, mf.path, config.UPLOAD_WORKERS,
+                                sender_pool=_sender_pool,
+                                on_progress=_make_progress_cb(f"album-pre {valid_msgs[i].id}"),
+                            )
+                            for i, mf in enumerate(mfs)
+                        ], return_exceptions=True)
+
+                        final_handles = []
+                        final_msgs = []
+                        for handle, msg in zip(pre_handles, valid_msgs):
+                            if isinstance(handle, Exception):
+                                logger.error(
+                                    f"Pre-upload failed for album member {msg.id}: {handle}"
+                                )
                             else:
-                                captions.append(msg.message or "")
-                        total_bytes = sum(mf.path.stat().st_size for mf in mfs)
-                        ul_timeout = max(config.OPERATION_TIMEOUT, total_bytes // 524_288 + 120)
-                        sent = await asyncio.wait_for(
-                            userbot.send_file(
-                                target_chat, file=[mf.path for mf in mfs], caption=captions,
-                                progress_callback=_make_progress_cb(
-                                    f"album msg {album_messages[0].id}"
+                                final_handles.append(handle)
+                                final_msgs.append(msg)
+
+                        if final_handles:
+                            captions = []
+                            for i, msg in enumerate(final_msgs):
+                                if i == len(final_msgs) - 1:
+                                    captions.append(_build_caption(msg.message or "", source_url))
+                                else:
+                                    captions.append(msg.message or "")
+                            total_bytes = sum(mf.path.stat().st_size for mf in mfs)
+                            ul_timeout = max(config.OPERATION_TIMEOUT, total_bytes // 524_288 + 120)
+                            sent = await asyncio.wait_for(
+                                userbot.send_file(
+                                    target_chat, file=final_handles, caption=captions,
+                                    progress_callback=_make_progress_cb(
+                                        f"album msg {album_messages[0].id}"
+                                    ),
                                 ),
-                            ),
-                            timeout=ul_timeout,
-                        )
-                        if sent:
-                            for orig_msg in album_messages:
-                                pending_records.append((job_id, orig_msg.id, None))
-                                transferred_ids.add(orig_msg.id)
-                            transferred += len(album_messages)
+                                timeout=ul_timeout,
+                            )
+                            if sent:
+                                for orig_msg in album_messages:
+                                    pending_records.append((job_id, orig_msg.id, None))
+                                    transferred_ids.add(orig_msg.id)
+                                transferred += len(album_messages)
+                        else:
+                            failed_ids.append(album_messages[0].id)
                     else:
                         failed_ids.append(album_messages[0].id)
                 except Exception as e:
@@ -503,9 +523,10 @@ async def transfer_bulk(
                 finally:
                     for mf in (mfs or []):
                         mf.cleanup()
+                    await byte_budget.release(bytes_held)
 
             elif kind == "single":
-                _, message, mf, source_url = item
+                _, message, mf, source_url, bytes_held = item
                 try:
                     ul_size = mf.path.stat().st_size if mf else 0
                     ul_timeout = max(config.OPERATION_TIMEOUT, ul_size // 524_288 + 120)
@@ -513,6 +534,7 @@ async def transfer_bulk(
                         _upload_prepared(
                             userbot, message, mf, target_chat, source_url,
                             progress_cb=_make_progress_cb(f"msg {message.id}"),
+                            sender_pool=_sender_pool,
                         ),
                         timeout=ul_timeout,
                     )
@@ -527,8 +549,9 @@ async def transfer_bulk(
                 finally:
                     if mf:
                         mf.cleanup()
+                    await byte_budget.release(bytes_held)
 
-            queue.task_done()
+            upload_queue.task_done()
 
             # Flush batch records every 20 messages
             if len(pending_records) >= 20:
@@ -542,41 +565,82 @@ async def transfer_bulk(
 
             await rate_limit_sleep(cfg.TRANSFER_DELAY)
 
-    producer_task = asyncio.create_task(_producer())
-    consumer_task = asyncio.create_task(_consumer())
-
     stuck_timeout = int(getattr(cfg, "STUCK_TIMEOUT", 600))  # seconds, default 10 min
 
-    async def _watchdog():
-        while True:
-            await asyncio.sleep(15)
-            if producer_task.done() and consumer_task.done():
-                return
-            if cancel_event.is_set():
-                # Give tasks a 30s grace period to finish cleanly, then force-cancel
-                await asyncio.sleep(30)
-                if not producer_task.done():
-                    producer_task.cancel()
-                if not consumer_task.done():
-                    consumer_task.cancel()
-                return
-            idle = time.monotonic() - last_activity[0]
-            if idle >= stuck_timeout:
-                logger.error(
-                    f"Job {job_id} stuck for {idle:.0f}s with no I/O activity — force-cancelling tasks"
-                )
-                producer_task.cancel()
-                consumer_task.cancel()
-                return
+    _sender_pool = None  # assigned inside async with; captured by _consumer closure
 
-    watchdog_task = asyncio.create_task(_watchdog())
     try:
+        async with SenderPool(userbot, cfg.SENDER_POOL_SIZE) as _sender_pool:
+            producer_task = asyncio.create_task(_producer())
+            consumer_task = asyncio.create_task(_consumer())
+
+            async def _watchdog():
+                while True:
+                    await asyncio.sleep(15)
+                    if producer_task.done() and consumer_task.done():
+                        return
+                    if cancel_event.is_set():
+                        # Give tasks a 30s grace period to finish cleanly, then force-cancel
+                        await asyncio.sleep(30)
+                        if not producer_task.done():
+                            producer_task.cancel()
+                        if not consumer_task.done():
+                            consumer_task.cancel()
+                        return
+                    idle = time.monotonic() - last_activity[0]
+                    if idle >= stuck_timeout:
+                        logger.error(
+                            f"Job {job_id} stuck for {idle:.0f}s with no I/O activity — force-cancelling tasks"
+                        )
+                        producer_task.cancel()
+                        consumer_task.cancel()
+                        return
+
+            watchdog_task = asyncio.create_task(_watchdog())
+            try:
+                try:
+                    await asyncio.gather(producer_task, consumer_task)
+                except asyncio.CancelledError:
+                    pass
+            finally:
+                watchdog_task.cancel()
+    except Exception as exc:
+        logger.error(f"Job {job_id} SenderPool error: {exc}; continuing without pool")
+        # Fall back: run without a pool (SENDER_POOL_SIZE=1 emulation via main sender)
+        _sender_pool = None
+        producer_task = asyncio.create_task(_producer())
+        consumer_task = asyncio.create_task(_consumer())
+
+        async def _watchdog_fallback():
+            while True:
+                await asyncio.sleep(15)
+                if producer_task.done() and consumer_task.done():
+                    return
+                if cancel_event.is_set():
+                    await asyncio.sleep(30)
+                    if not producer_task.done():
+                        producer_task.cancel()
+                    if not consumer_task.done():
+                        consumer_task.cancel()
+                    return
+                idle = time.monotonic() - last_activity[0]
+                if idle >= stuck_timeout:
+                    logger.error(
+                        f"Job {job_id} stuck for {idle:.0f}s — force-cancelling tasks"
+                    )
+                    producer_task.cancel()
+                    consumer_task.cancel()
+                    return
+
+        watchdog_task = asyncio.create_task(_watchdog_fallback())
         try:
-            await asyncio.gather(producer_task, consumer_task)
-        except asyncio.CancelledError:
-            pass
+            try:
+                await asyncio.gather(producer_task, consumer_task)
+            except asyncio.CancelledError:
+                pass
+        finally:
+            watchdog_task.cancel()
     finally:
-        watchdog_task.cancel()
         await _flush_records()
         final_status = "cancelled" if cancel_event.is_set() else "done"
         await db_module.update_job(
@@ -589,6 +653,7 @@ async def _upload_file_parallel(
     userbot: TelegramClient,
     file_path: Path,
     n_workers: int,
+    sender_pool=None,
     on_progress=None,
 ):
     """Upload a file using N concurrent SaveBigFilePartRequest workers.
@@ -619,11 +684,13 @@ async def _upload_file_parallel(
             for part_index in range(worker_id, part_count, workers):
                 f.seek(part_index * PART_SIZE)
                 part = f.read(PART_SIZE)
-                result = await userbot(
-                    tl_functions.upload.SaveBigFilePartRequest(
-                        file_id, part_index, part_count, part
-                    )
+                req = tl_functions.upload.SaveBigFilePartRequest(
+                    file_id, part_index, part_count, part
                 )
+                if sender_pool is not None:
+                    result = await sender_pool.send(req)
+                else:
+                    result = await userbot(req)
                 if not result:
                     raise RuntimeError(
                         f"Failed to upload part {part_index} of {file_path.name}"
@@ -643,6 +710,7 @@ async def _upload_prepared(
     target_chat,
     source_url: str,
     progress_cb=None,
+    sender_pool=None,
 ) -> Optional[Message]:
     """Upload a single message given a pre-downloaded _MediaFile (or None for text-only).
 
@@ -673,7 +741,8 @@ async def _upload_prepared(
     # Photos are skipped: they go through a different resize/send path.
     if media_type != "photo" and config.UPLOAD_WORKERS > 1:
         upload_handle = await _upload_file_parallel(
-            userbot, mf.path, config.UPLOAD_WORKERS, on_progress=progress_cb
+            userbot, mf.path, config.UPLOAD_WORKERS,
+            sender_pool=sender_pool, on_progress=progress_cb,
         )
     else:
         upload_handle = mf.path  # let send_file upload sequentially
@@ -691,13 +760,15 @@ async def _upload_prepared(
             mf.path = await convert_video(mf.path)
             # Re-upload after conversion (path changed, handle is now stale)
             upload_handle = await _upload_file_parallel(
-                userbot, mf.path, config.UPLOAD_WORKERS, on_progress=progress_cb
+                userbot, mf.path, config.UPLOAD_WORKERS,
+                sender_pool=sender_pool, on_progress=progress_cb,
             )
         else:
             mf.path = await ensure_faststart(mf.path)
             if config.UPLOAD_WORKERS > 1:
                 upload_handle = await _upload_file_parallel(
-                    userbot, mf.path, config.UPLOAD_WORKERS, on_progress=progress_cb
+                    userbot, mf.path, config.UPLOAD_WORKERS,
+                    sender_pool=sender_pool, on_progress=progress_cb,
                 )
             else:
                 upload_handle = mf.path

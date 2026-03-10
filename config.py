@@ -27,3 +27,5 @@ ITER_TIMEOUT = int(os.environ.get("ITER_TIMEOUT", "120"))
 DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "4"))
 # Parallel part workers for large file uploads (>10 MB)
 UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "4"))
+# Number of independent MTProto TCP connections for parallel uploads
+SENDER_POOL_SIZE = int(os.environ.get("SENDER_POOL_SIZE", "4"))
