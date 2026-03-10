@@ -10,12 +10,14 @@ from pathlib import Path
 from typing import List, Optional, Set, Tuple
 
 from telethon import TelegramClient, utils as tl_utils
+from telethon.tl import functions as tl_functions
 from telethon.tl.types import (
     Message,
     MessageMediaPoll,
     DocumentAttributeVideo,
     DocumentAttributeFilename,
     InputDocumentFileLocation,
+    InputFileBig,
     PeerChannel,
     PeerChat,
 )
@@ -583,6 +585,57 @@ async def transfer_bulk(
         logger.info(f"Job {job_id} {final_status}: {transferred}/{total} transferred, {len(failed_ids)} failed")
 
 
+async def _upload_file_parallel(
+    userbot: TelegramClient,
+    file_path: Path,
+    n_workers: int,
+    on_progress=None,
+):
+    """Upload a file using N concurrent SaveBigFilePartRequest workers.
+
+    Telethon queues all async calls through its MTProto sender, so N
+    workers keep N chunk-upload requests in-flight simultaneously instead
+    of waiting for each ACK before sending the next one.
+
+    Returns an InputFileBig handle that can be passed directly to send_file().
+    Falls back to the standard sequential upload_file() for small files (<10 MB).
+    """
+    file_size = file_path.stat().st_size
+
+    if file_size <= 10 * 1024 * 1024:
+        # Small files don't benefit enough from parallelism
+        return await userbot.upload_file(str(file_path), progress_callback=on_progress)
+
+    PART_SIZE = 512 * 1024  # 512 KB — maximum allowed by Telegram
+    part_count = (file_size + PART_SIZE - 1) // PART_SIZE
+    file_id = int.from_bytes(os.urandom(8), "little", signed=True)
+    workers = min(n_workers, part_count)
+    uploaded = [0]
+
+    async def _upload_worker(worker_id: int) -> None:
+        # Interleaved: worker i handles parts i, i+workers, i+2*workers, ...
+        # so all workers stay busy until the very last chunk.
+        with open(file_path, "rb") as f:
+            for part_index in range(worker_id, part_count, workers):
+                f.seek(part_index * PART_SIZE)
+                part = f.read(PART_SIZE)
+                result = await userbot(
+                    tl_functions.upload.SaveBigFilePartRequest(
+                        file_id, part_index, part_count, part
+                    )
+                )
+                if not result:
+                    raise RuntimeError(
+                        f"Failed to upload part {part_index} of {file_path.name}"
+                    )
+                uploaded[0] += len(part)
+                if on_progress:
+                    on_progress(uploaded[0], file_size)
+
+    await asyncio.gather(*[_upload_worker(i) for i in range(workers)])
+    return InputFileBig(file_id, part_count, file_path.name)
+
+
 async def _upload_prepared(
     userbot: TelegramClient,
     message: Message,
@@ -615,9 +668,19 @@ async def _upload_prepared(
     if progress_cb is None:
         progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
 
+    # For non-photo media, pre-upload the file with parallel workers so that
+    # N chunk-upload requests are in-flight concurrently instead of one at a time.
+    # Photos are skipped: they go through a different resize/send path.
+    if media_type != "photo" and config.UPLOAD_WORKERS > 1:
+        upload_handle = await _upload_file_parallel(
+            userbot, mf.path, config.UPLOAD_WORKERS, on_progress=progress_cb
+        )
+    else:
+        upload_handle = mf.path  # let send_file upload sequentially
+
     if media_type == "photo":
         sent = await userbot.send_file(
-            target_chat, file=mf.path, caption=caption,
+            target_chat, file=upload_handle, caption=caption,
             formatting_entities=message.entities,
             force_document=False, progress_callback=progress_cb,
         )
@@ -626,46 +689,56 @@ async def _upload_prepared(
         if needs_video_conversion(message):
             logger.info(f"Converting non-H.264 video for message {message.id}")
             mf.path = await convert_video(mf.path)
+            # Re-upload after conversion (path changed, handle is now stale)
+            upload_handle = await _upload_file_parallel(
+                userbot, mf.path, config.UPLOAD_WORKERS, on_progress=progress_cb
+            )
         else:
             mf.path = await ensure_faststart(mf.path)
+            if config.UPLOAD_WORKERS > 1:
+                upload_handle = await _upload_file_parallel(
+                    userbot, mf.path, config.UPLOAD_WORKERS, on_progress=progress_cb
+                )
+            else:
+                upload_handle = mf.path
         video_attr = _get_video_attr(message)
         duration = getattr(video_attr, "duration", 0) or 0
         w = getattr(video_attr, "w", 0) or 0
         h = getattr(video_attr, "h", 0) or 0
         sent = await userbot.send_file(
-            target_chat, file=mf.path, caption=caption,
+            target_chat, file=upload_handle, caption=caption,
             formatting_entities=message.entities,
             force_document=False,
             attributes=[DocumentAttributeVideo(
                 duration=duration, w=w, h=h, supports_streaming=True
             )],
-            progress_callback=progress_cb,
+            progress_callback=None,  # upload already done
         )
 
     elif media_type == "voice":
         sent = await userbot.send_file(
-            target_chat, file=mf.path, caption=caption,
+            target_chat, file=upload_handle, caption=caption,
             formatting_entities=message.entities,
-            voice_note=True, progress_callback=progress_cb,
+            voice_note=True, progress_callback=None,
         )
 
     elif media_type == "video_note":
         sent = await userbot.send_file(
-            target_chat, file=mf.path, caption=caption,
-            video_note=True, progress_callback=progress_cb,
+            target_chat, file=upload_handle, caption=caption,
+            video_note=True, progress_callback=None,
         )
 
     elif media_type == "animation":
         sent = await userbot.send_file(
-            target_chat, file=mf.path, caption=caption,
-            formatting_entities=message.entities, progress_callback=progress_cb,
+            target_chat, file=upload_handle, caption=caption,
+            formatting_entities=message.entities, progress_callback=None,
         )
 
     else:
         sent = await userbot.send_file(
-            target_chat, file=mf.path, caption=caption,
+            target_chat, file=upload_handle, caption=caption,
             formatting_entities=message.entities,
-            force_document=True, progress_callback=progress_cb,
+            force_document=True, progress_callback=None,
         )
 
     await _expand_telegraph(userbot, message.message, target_chat)
