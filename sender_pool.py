@@ -3,6 +3,7 @@ import logging
 
 from telethon import TelegramClient
 from telethon.network import MTProtoSender
+from telethon.tl.functions.help import GetConfigRequest
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +37,21 @@ class ByteBudget:
             self._cond.notify_all()
 
 
-def _find_ipv6_addr(client: TelegramClient) -> "tuple[str, int] | None":
-    """Return (ip, port) for the current DC's IPv6 endpoint, or None."""
+async def _find_ipv6_addr(client: TelegramClient) -> "tuple[str, int] | None":
+    """Return (ip, port) for the current DC's IPv6 endpoint, or None.
+
+    Reads client._config if already populated; otherwise fetches GetConfig
+    once and caches the result so subsequent calls are free.
+    """
     dc_id = client.session.dc_id
     cfg = getattr(client, "_config", None)
     if cfg is None:
-        return None
+        try:
+            cfg = await client(GetConfigRequest())
+            client._config = cfg
+        except Exception as exc:
+            logger.debug("SenderPool: GetConfig failed, IPv6 unavailable: %s", exc)
+            return None
     for opt in getattr(cfg, "dc_options", []):
         if (
             opt.id == dc_id
@@ -111,7 +121,7 @@ class SenderPool:
     async def __aenter__(self) -> "SenderPool":
         client = self._client
         ipv4 = (client.session.server_address, client.session.port)
-        ipv6 = _find_ipv6_addr(client)
+        ipv6 = await _find_ipv6_addr(client)
 
         if ipv6:
             logger.info(
