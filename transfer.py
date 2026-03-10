@@ -476,6 +476,8 @@ async def transfer_bulk(
                                 captions.append(_build_caption(msg.message or "", source_url))
                             else:
                                 captions.append(msg.message or "")
+                        total_bytes = sum(mf.path.stat().st_size for mf in mfs)
+                        ul_timeout = max(config.OPERATION_TIMEOUT, total_bytes // 524_288 + 120)
                         sent = await asyncio.wait_for(
                             userbot.send_file(
                                 target_chat, file=[mf.path for mf in mfs], caption=captions,
@@ -483,7 +485,7 @@ async def transfer_bulk(
                                     f"album msg {album_messages[0].id}"
                                 ),
                             ),
-                            timeout=config.OPERATION_TIMEOUT,
+                            timeout=ul_timeout,
                         )
                         if sent:
                             for orig_msg in album_messages:
@@ -502,12 +504,14 @@ async def transfer_bulk(
             elif kind == "single":
                 _, message, mf, source_url = item
                 try:
+                    ul_size = mf.path.stat().st_size if mf else 0
+                    ul_timeout = max(config.OPERATION_TIMEOUT, ul_size // 524_288 + 120)
                     sent = await asyncio.wait_for(
                         _upload_prepared(
                             userbot, message, mf, target_chat, source_url,
                             progress_cb=_make_progress_cb(f"msg {message.id}"),
                         ),
-                        timeout=config.OPERATION_TIMEOUT,
+                        timeout=ul_timeout,
                     )
                     if sent:
                         target_id = sent.id if not isinstance(sent, list) else None
@@ -780,9 +784,12 @@ async def _download_to_file(
     # --- Fresh download to TEMP_DIR ---
     tmp = config.TEMP_DIR / f"dl_{message.id}_{uuid.uuid4().hex}.bin"
     try:
+        file_size = _get_file_size(message) or 0
+        # Floor at OPERATION_TIMEOUT; add extra time assuming ≥512 KB/s minimum throughput
+        dl_timeout = max(config.OPERATION_TIMEOUT, file_size // 524_288 + 120)
         await asyncio.wait_for(
             userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
-            timeout=config.OPERATION_TIMEOUT,
+            timeout=dl_timeout,
         )
 
         ext = _get_doc_ext(message)
