@@ -757,6 +757,52 @@ def _get_doc_ext(message: Message) -> str:
     return ""
 
 
+async def _parallel_download(userbot, input_location, output_path: Path,
+                              file_size: int, dc_id: int,
+                              n_workers: int, on_progress=None) -> None:
+    """Download a document using N concurrent segment streams.
+
+    Each worker fetches a contiguous slice of the file.  Because
+    iter_download opens its own MTProto connection per generator, this
+    gives N independent download streams instead of one.
+    """
+    CHUNK = 512 * 1024  # 512 KB per request — max allowed by Telegram
+    total_chunks = (file_size + CHUNK - 1) // CHUNK
+    workers = min(n_workers, total_chunks)
+    chunks_per_worker = (total_chunks + workers - 1) // workers
+
+    # Pre-allocate file so random-offset writes work
+    with open(output_path, "wb") as f:
+        f.seek(file_size - 1)
+        f.write(b"\x00")
+
+    downloaded = [0]
+
+    async def fetch_segment(worker_id: int) -> None:
+        start_chunk = worker_id * chunks_per_worker
+        count = min(chunks_per_worker, total_chunks - start_chunk)
+        if count <= 0:
+            return
+        offset = start_chunk * CHUNK
+        with open(output_path, "r+b") as f:
+            pos = offset
+            async for chunk in userbot.iter_download(
+                input_location,
+                offset=offset,
+                limit=count,
+                request_size=CHUNK,
+                dc_id=dc_id,
+            ):
+                f.seek(pos)
+                f.write(chunk)
+                pos += len(chunk)
+                downloaded[0] += len(chunk)
+                if on_progress:
+                    on_progress(downloaded[0], file_size)
+
+    await asyncio.gather(*[fetch_segment(i) for i in range(workers)])
+
+
 async def _download_to_file(
     userbot: TelegramClient, message: Message, cache=None, on_progress=None
 ) -> Optional[_MediaFile]:
@@ -790,27 +836,24 @@ async def _download_to_file(
         dl_timeout = max(config.OPERATION_TIMEOUT, file_size // 524_288 + 120)
 
         media = message.media
-        if hasattr(media, "document") and media.document:
-            # Use parallel workers for document downloads (videos, files, etc.)
+        if hasattr(media, "document") and media.document and file_size > 0:
+            # Parallel segment download for documents (videos, large files).
+            # iter_download opens a separate connection per generator, so N workers
+            # = N concurrent TCP streams = N× throughput over a single connection.
             doc = media.document
+            loc = InputDocumentFileLocation(
+                id=doc.id,
+                access_hash=doc.access_hash,
+                file_reference=doc.file_reference,
+                thumb_size="",
+            )
             await asyncio.wait_for(
-                userbot.download_file(
-                    InputDocumentFileLocation(
-                        id=doc.id,
-                        access_hash=doc.access_hash,
-                        file_reference=doc.file_reference,
-                        thumb_size="",
-                    ),
-                    file=str(tmp),
-                    file_size=doc.size,
-                    dc_id=doc.dc_id,
-                    progress_callback=on_progress,
-                    workers=config.DOWNLOAD_WORKERS,
-                ),
+                _parallel_download(userbot, loc, tmp, file_size, doc.dc_id,
+                                   config.DOWNLOAD_WORKERS, on_progress),
                 timeout=dl_timeout,
             )
         else:
-            # Photos and other media types — no parallel-worker API available
+            # Photos and other media types — fall back to download_media
             await asyncio.wait_for(
                 userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
                 timeout=dl_timeout,
