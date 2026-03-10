@@ -17,3 +17,9 @@ CACHE_DIR = os.environ.get("CACHE_DIR", "cache")
 MAX_CACHE_SIZE = int(os.environ.get("MAX_CACHE_SIZE", str(1024 * 1024 * 1024)))  # bytes, default 1 GB
 # Real disk path for temp files during transfer — must NOT be a tmpfs mount
 TEMP_DIR = Path(os.environ.get("TEMP_DIR", "tmp"))
+# Seconds with no transfer progress before a bulk job is force-killed (default 10 min)
+STUCK_TIMEOUT = int(os.environ.get("STUCK_TIMEOUT", "600"))
+# Seconds before a single download or upload is considered hung (default 10 min)
+OPERATION_TIMEOUT = int(os.environ.get("OPERATION_TIMEOUT", "600"))
+# Seconds before a single iter_messages batch call is considered hung (default 2 min)
+ITER_TIMEOUT = int(os.environ.get("ITER_TIMEOUT", "120"))

@@ -33,6 +33,15 @@ logger = logging.getLogger(__name__)
 _MAX_FILE_SIZE = 4 * 1024 ** 3 if config.IS_PREMIUM else 2 * 1024 ** 3
 
 
+async def _iter_with_timeout(async_iter, timeout):
+    """Wrap an async iterator so each __anext__() call has a per-item timeout."""
+    while True:
+        try:
+            yield await asyncio.wait_for(async_iter.__anext__(), timeout=timeout)
+        except StopAsyncIteration:
+            return
+
+
 @dataclass
 class _MediaFile:
     """Wraps an on-disk temp file.  Call cleanup() when done to delete it."""
@@ -304,8 +313,11 @@ async def transfer_bulk(
     total = total_list.total
     await db_module.update_job(db, job_id, status="running", total=total)
 
-    # Load all already-transferred IDs upfront (one query instead of per-message checks)
-    transferred_ids: Set[int] = await db_module.get_transferred_ids(db, job_id)
+    # Load all already-transferred IDs across all jobs for this source→target pair
+    _job = await db_module.get_job(db, job_id)
+    transferred_ids: Set[int] = await db_module.get_transferred_ids_for_chat_pair(
+        db, _job.source_chat, _job.target_chat
+    )
 
     queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.CONCURRENT_TRANSFERS)
 
@@ -354,7 +366,9 @@ async def transfer_bulk(
             pending_singles.clear()
 
         try:
-            async for message in userbot.iter_messages(source_chat, reverse=True):
+            async for message in _iter_with_timeout(
+                userbot.iter_messages(source_chat, reverse=True), config.ITER_TIMEOUT
+            ):
                 if cancel_event.is_set():
                     break
                 if message.action:
@@ -448,11 +462,14 @@ async def transfer_bulk(
                                 captions.append(_build_caption(msg.message or "", source_url))
                             else:
                                 captions.append(msg.message or "")
-                        sent = await userbot.send_file(
-                            target_chat, file=[mf.path for mf in mfs], caption=captions,
-                            progress_callback=make_upload_progress_cb(
-                                f"album msg {album_messages[0].id}", logger
+                        sent = await asyncio.wait_for(
+                            userbot.send_file(
+                                target_chat, file=[mf.path for mf in mfs], caption=captions,
+                                progress_callback=make_upload_progress_cb(
+                                    f"album msg {album_messages[0].id}", logger
+                                ),
                             ),
+                            timeout=config.OPERATION_TIMEOUT,
                         )
                         if sent:
                             for orig_msg in album_messages:
@@ -471,7 +488,10 @@ async def transfer_bulk(
             elif kind == "single":
                 _, message, mf, source_url = item
                 try:
-                    sent = await _upload_prepared(userbot, message, mf, target_chat, source_url)
+                    sent = await asyncio.wait_for(
+                        _upload_prepared(userbot, message, mf, target_chat, source_url),
+                        timeout=config.OPERATION_TIMEOUT,
+                    )
                     if sent:
                         target_id = sent.id if not isinstance(sent, list) else None
                         pending_records.append((job_id, message.id, target_id))
@@ -501,15 +521,50 @@ async def transfer_bulk(
     producer_task = asyncio.create_task(_producer())
     consumer_task = asyncio.create_task(_consumer())
 
-    await asyncio.gather(producer_task, consumer_task)
+    stuck_timeout = int(getattr(cfg, "STUCK_TIMEOUT", 600))  # seconds, default 10 min
 
-    await _flush_records()
+    async def _watchdog():
+        last_transferred = transferred
+        elapsed = 0
+        while True:
+            await asyncio.sleep(15)
+            if producer_task.done() and consumer_task.done():
+                return
+            if cancel_event.is_set():
+                # Give tasks a 30s grace period to finish cleanly, then force-cancel
+                await asyncio.sleep(30)
+                if not producer_task.done():
+                    producer_task.cancel()
+                if not consumer_task.done():
+                    consumer_task.cancel()
+                return
+            if transferred > last_transferred:
+                last_transferred = transferred
+                elapsed = 0
+            else:
+                elapsed += 15
+                if elapsed >= stuck_timeout:
+                    logger.error(
+                        f"Job {job_id} stuck for {elapsed}s with no progress — force-cancelling tasks"
+                    )
+                    producer_task.cancel()
+                    consumer_task.cancel()
+                    return
 
-    final_status = "cancelled" if cancel_event.is_set() else "done"
-    await db_module.update_job(
-        db, job_id, status=final_status, transferred=transferred, failed_ids=failed_ids
-    )
-    logger.info(f"Job {job_id} {final_status}: {transferred}/{total} transferred, {len(failed_ids)} failed")
+    watchdog_task = asyncio.create_task(_watchdog())
+    try:
+        try:
+            await asyncio.gather(producer_task, consumer_task)
+        except asyncio.CancelledError:
+            pass
+    finally:
+        watchdog_task.cancel()
+        await _flush_records()
+        final_status = "cancelled" if cancel_event.is_set() else "done"
+        await db_module.update_job(
+            db, job_id, status=final_status, transferred=transferred, failed_ids=failed_ids
+        )
+        logger.info(f"Job {job_id} {final_status}: {transferred}/{total} transferred, {len(failed_ids)} failed")
 
 
 async def _upload_prepared(
@@ -712,7 +767,10 @@ async def _download_to_file(
     # --- Fresh download to TEMP_DIR ---
     tmp = config.TEMP_DIR / f"dl_{message.id}_{uuid.uuid4().hex}.bin"
     try:
-        await userbot.download_media(message, file=str(tmp))
+        await asyncio.wait_for(
+            userbot.download_media(message, file=str(tmp)),
+            timeout=config.OPERATION_TIMEOUT,
+        )
 
         ext = _get_doc_ext(message)
         if not ext:

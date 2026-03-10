@@ -6,6 +6,7 @@ from enum import Enum
 class TransferStatus(str, Enum):
     PENDING = "pending"
     RUNNING = "running"
+    INTERRUPTED = "interrupted"
     DONE = "done"
     CANCELLED = "cancelled"
     FAILED = "failed"

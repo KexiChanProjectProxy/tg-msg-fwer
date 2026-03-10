@@ -10,6 +10,7 @@ from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo,
 import config
 import database as db_module
 from media import get_media_type, probe_extension
+from models import TransferStatus
 from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk, transfer_bulk_files
 from utils import build_message_url
 
@@ -84,6 +85,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             "`/bulkfiles <source> <target>` — Transfer media-only (oldest first)\n"
             "`/status [job_id]` — Show job progress\n"
             "`/cancel <job_id>` — Cancel a bulk job\n"
+            "`/resume <job_id>` — Resume an interrupted or failed job\n"
             "`/help` — Show this message\n\n"
             "You can also send or forward any file to the bot and reply with a "
             "target channel to upload it there."
@@ -274,15 +276,82 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
         job_id = int(event.pattern_match.group(1))
 
-        if job_id not in active_tasks:
-            return await event.reply(f"Job #{job_id} is not currently running.")
+        if job_id in active_tasks:
+            _, cancel_event = active_tasks[job_id]
+            cancel_event.set()
+            return await event.reply(
+                f"Cancellation requested for job #{job_id}. "
+                "It will stop after the current transfer completes."
+            )
 
-        _, cancel_event = active_tasks[job_id]
-        cancel_event.set()
-        await event.reply(
-            f"Cancellation requested for job #{job_id}. "
-            "It will stop after the current transfer completes."
-        )
+        # Not actively running — check DB and cancel there if appropriate
+        job = await db_module.get_job(db, job_id)
+        if not job:
+            return await event.reply(f"Job #{job_id} not found.")
+        if job.status in (TransferStatus.DONE, TransferStatus.CANCELLED):
+            return await event.reply(f"Job #{job_id} is already {job.status.value}.")
+        await db_module.update_job(db, job_id, status="cancelled")
+        await event.reply(f"Job #{job_id} marked as cancelled.")
+
+    @bot.on(events.NewMessage(pattern=r"/resume (\d+)"))
+    async def cmd_resume(event):
+        if not is_admin(event.sender_id):
+            return
+
+        job_id = int(event.pattern_match.group(1))
+        job = await db_module.get_job(db, job_id)
+
+        if not job:
+            return await event.reply(f"Job #{job_id} not found.")
+        if job.status not in (TransferStatus.INTERRUPTED, TransferStatus.FAILED):
+            return await event.reply(
+                f"Job #{job_id} has status '{job.status.value}' — can only resume interrupted or failed jobs."
+            )
+        if job_id in active_tasks:
+            return await event.reply(f"Job #{job_id} is already running.")
+
+        status_msg = await event.reply(f"Resuming job #{job_id}...")
+
+        try:
+            source_chat = await resolve_chat(userbot, job.source_chat)
+            target_chat = await resolve_chat(userbot, job.target_chat)
+            cancel_event = asyncio.Event()
+
+            async def run_resume():
+                try:
+                    await transfer_bulk(
+                        userbot, source_chat, target_chat, job_id, db, config, cancel_event
+                    )
+                    job_updated = await db_module.get_job(db, job_id)
+                    try:
+                        await bot.send_message(
+                            event.sender_id,
+                            f"Bulk transfer job #{job_id} completed: "
+                            f"{job_updated.transferred}/{job_updated.total} transferred, "
+                            f"{len(job_updated.failed_ids)} failed.",
+                        )
+                    except Exception:
+                        pass
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    logger.error(f"Resume job {job_id} error: {e}", exc_info=True)
+                    await db_module.update_job(db, job_id, status="failed", error=str(e))
+                finally:
+                    active_tasks.pop(job_id, None)
+
+            task = asyncio.create_task(run_resume())
+            active_tasks[job_id] = (task, cancel_event)
+
+            await status_msg.edit(
+                f"Job #{job_id} resumed!\n"
+                f"Source: {job.source_chat} → Target: {job.target_chat}\n"
+                f"Use `/status {job_id}` to check progress."
+            )
+
+        except Exception as e:
+            logger.error(f"Resume start error: {e}", exc_info=True)
+            await status_msg.edit(f"Error: {e}")
 
     # Register the forwarded-message handler last so /commands take priority
     @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
@@ -410,7 +479,7 @@ def _parse_message_url(url: str):
 
 def _format_job(job) -> str:
     pct = f"{job.transferred / job.total * 100:.1f}%" if job.total else "0%"
-    return (
+    text = (
         f"**Job #{job.id}**\n"
         f"Status: {job.status.value}\n"
         f"Progress: {job.transferred}/{job.total} ({pct})\n"
@@ -419,3 +488,6 @@ def _format_job(job) -> str:
         f"Failed: {len(job.failed_ids)}\n"
         f"Updated: {job.updated_at}"
     )
+    if job.status == TransferStatus.INTERRUPTED:
+        text += f"\nUse `/resume {job.id}` to continue."
+    return text

@@ -30,6 +30,9 @@ async def init_db(db_path: str) -> aiosqlite.Connection:
             UNIQUE(job_id, source_msg_id)
         )
     """)
+    await db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_jobs_chat_pair ON jobs(source_chat, target_chat)"
+    )
     await db.commit()
     return db
 
@@ -95,6 +98,28 @@ async def get_transferred_ids(db, job_id: int) -> Set[int]:
     ) as cursor:
         rows = await cursor.fetchall()
     return {row[0] for row in rows}
+
+
+async def get_transferred_ids_for_chat_pair(db, source_chat: str, target_chat: str) -> Set[int]:
+    """Load all transferred source message IDs for any job with the same source→target pair."""
+    async with db.execute(
+        """SELECT tm.source_msg_id
+           FROM transferred_messages tm
+           JOIN jobs j ON tm.job_id = j.id
+           WHERE j.source_chat = ? AND j.target_chat = ?""",
+        (source_chat, target_chat),
+    ) as cursor:
+        rows = await cursor.fetchall()
+    return {row[0] for row in rows}
+
+
+async def recover_interrupted_jobs(db) -> int:
+    """Mark all 'running' jobs as 'interrupted' at startup. Returns count updated."""
+    cursor = await db.execute(
+        "UPDATE jobs SET status = 'interrupted', updated_at = CURRENT_TIMESTAMP WHERE status = 'running'"
+    )
+    await db.commit()
+    return cursor.rowcount
 
 
 async def record_transfers_batch(db, records: List[Tuple[int, int, Optional[int]]]):

@@ -17,6 +17,10 @@ logger = logging.getLogger(__name__)
 async def main():
     db = await db_module.init_db(config.DB_PATH)
 
+    recovered = await db_module.recover_interrupted_jobs(db)
+    if recovered:
+        logger.info(f"Marked {recovered} interrupted job(s) as 'interrupted'")
+
     userbot = TelegramClient(
         config.USERBOT_SESSION,
         config.API_ID,
