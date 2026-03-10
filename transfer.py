@@ -15,6 +15,7 @@ from telethon.tl.types import (
     MessageMediaPoll,
     DocumentAttributeVideo,
     DocumentAttributeFilename,
+    InputDocumentFileLocation,
     PeerChannel,
     PeerChat,
 )
@@ -787,10 +788,33 @@ async def _download_to_file(
         file_size = _get_file_size(message) or 0
         # Floor at OPERATION_TIMEOUT; add extra time assuming ≥512 KB/s minimum throughput
         dl_timeout = max(config.OPERATION_TIMEOUT, file_size // 524_288 + 120)
-        await asyncio.wait_for(
-            userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
-            timeout=dl_timeout,
-        )
+
+        media = message.media
+        if hasattr(media, "document") and media.document:
+            # Use parallel workers for document downloads (videos, files, etc.)
+            doc = media.document
+            await asyncio.wait_for(
+                userbot.download_file(
+                    InputDocumentFileLocation(
+                        id=doc.id,
+                        access_hash=doc.access_hash,
+                        file_reference=doc.file_reference,
+                        thumb_size="",
+                    ),
+                    file=str(tmp),
+                    file_size=doc.size,
+                    dc_id=doc.dc_id,
+                    progress_callback=on_progress,
+                    workers=config.DOWNLOAD_WORKERS,
+                ),
+                timeout=dl_timeout,
+            )
+        else:
+            # Photos and other media types — no parallel-worker API available
+            await asyncio.wait_for(
+                userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
+                timeout=dl_timeout,
+            )
 
         ext = _get_doc_ext(message)
         if not ext:
