@@ -26,6 +26,7 @@ async def main():
         config.API_ID,
         config.API_HASH,
         flood_sleep_threshold=60,
+        use_ipv6=True,
     )
 
     bot = TelegramClient(
