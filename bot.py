@@ -3,7 +3,7 @@ import io
 import logging
 import shutil
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Union
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Button
@@ -23,8 +23,8 @@ logger = logging.getLogger(__name__)
 # job_id -> (asyncio.Task, asyncio.Event)
 active_tasks: Dict[int, Tuple[asyncio.Task, asyncio.Event]] = {}
 
-# user_id -> forwarded Message awaiting a target channel
-pending_forwards: Dict[int, Message] = {}
+# user_id -> forwarded Message (or album List[Message]) awaiting a target channel
+pending_forwards: Dict[int, Union[Message, List[Message]]] = {}
 
 
 def is_admin(user_id: int) -> bool:
@@ -32,6 +32,10 @@ def is_admin(user_id: int) -> bool:
 
 
 def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cache=None):
+
+    ALBUM_COLLECT_DELAY = 0.5  # seconds to wait for all album members
+    _album_buffer: Dict[int, List[Message]] = {}   # grouped_id -> messages
+    _album_timers: Dict[int, asyncio.Task] = {}    # grouped_id -> debounce task
 
     @bot.on(events.NewMessage(pattern="/start"))
     async def cmd_start(event):
@@ -436,6 +440,96 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
         await status_msg.edit("Done!")
         return True
 
+    async def _transfer_album_to_default(album_messages: List[Message], target_ref: str, status_msg) -> bool:
+        """
+        Transfer an album (list of grouped messages) to the channel identified by target_ref.
+        Tries the original channel source first (once for the whole album); falls back to
+        downloading all members from the bot and sending them as a grouped album.
+        Returns True on success.
+        """
+        try:
+            target_chat = await resolve_chat(userbot, target_ref)
+        except Exception as e:
+            await status_msg.edit(f"Could not resolve channel {target_ref!r}: {e}")
+            return False
+
+        first = album_messages[0]
+        fwd_from = first.fwd_from
+        channel_id = getattr(fwd_from, "channel_id", None)
+        channel_post = getattr(fwd_from, "channel_post", None)
+
+        if channel_id and channel_post:
+            await status_msg.edit("Fetching original album from source channel...")
+            source_ref = f"-100{channel_id}"
+            try:
+                source_chat = await resolve_chat(userbot, source_ref)
+                messages = await resolve_message(userbot, source_chat, channel_post)
+            except Exception:
+                messages = []
+
+            if messages:
+                source_url = build_message_url(source_chat, channel_post)
+                await status_msg.edit("Transferring album...")
+                if len(messages) == 1:
+                    await transfer_one_message(userbot, messages[0], target_chat, source_url, cache=file_cache)
+                else:
+                    await transfer_album(userbot, messages, target_chat, source_url, cache=file_cache)
+                await status_msg.edit("Done!")
+                return True
+            # Fall through to direct download
+
+        # Fallback: download all members from bot, send as grouped album
+        await status_msg.edit(f"Downloading {len(album_messages)} media file(s)...")
+        bufs = []
+        for msg in album_messages:
+            buf = io.BytesIO()
+            await bot.download_media(msg, file=buf)
+            buf.seek(0)
+            if hasattr(msg.media, "document"):
+                for attr in getattr(msg.media.document, "attributes", []):
+                    if isinstance(attr, DocumentAttributeFilename):
+                        buf.name = attr.file_name
+                        break
+            if not getattr(buf, "name", None):
+                ext = await probe_extension(buf)
+                buf.name = f"file.{ext}"
+            bufs.append(buf)
+
+        await status_msg.edit("Uploading album...")
+        await userbot.send_file(target_chat, file=bufs, force_document=False)
+        await status_msg.edit("Done!")
+        return True
+
+    async def _process_album_after_delay(grouped_id: int, sender_id: int):
+        """Debounce handler: wait for all album members, then route them together."""
+        await asyncio.sleep(ALBUM_COLLECT_DELAY)
+        messages = _album_buffer.pop(grouped_id, [])
+        _album_timers.pop(grouped_id, None)
+        if not messages:
+            return
+
+        messages.sort(key=lambda m: m.id)
+        first = messages[0]
+        default_ch = _default_channel_for(first)
+
+        if default_ch:
+            status_msg = await bot.send_message(
+                sender_id,
+                f"Auto-routing album ({len(messages)} media) to default channel…"
+            )
+            try:
+                await _transfer_album_to_default(messages, default_ch, status_msg)
+            except Exception as e:
+                logger.error(f"Album auto-route error: {e}", exc_info=True)
+                await status_msg.edit(f"Error: {e}")
+        else:
+            pending_forwards[sender_id] = messages
+            await bot.send_message(
+                sender_id,
+                f"Received album with {len(messages)} media file(s). "
+                "Where should I send it? Reply with the channel username or URL."
+            )
+
     async def _handle_telegraph_urls(urls: List[str], status_msg) -> bool:
         """Fetch Telegraph articles and upload images to DEFAULT_IMAGE_CHANNEL."""
         if not config.DEFAULT_IMAGE_CHANNEL:
@@ -512,9 +606,10 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
             if videos and config.DEFAULT_VIDEO_CHANNEL:
                 vid_chat = await resolve_chat(userbot, config.DEFAULT_VIDEO_CHANNEL)
-                for i, vpath in enumerate(videos, 1):
-                    await status_msg.edit(f"Uploading video {i}/{len(videos)}…")
-                    await userbot.send_file(vid_chat, file=str(vpath), force_document=False)
+                await status_msg.edit(f"Uploading {len(videos)} video(s)…")
+                for chunk_start in range(0, len(videos), 10):
+                    chunk = [str(p) for p in videos[chunk_start:chunk_start + 10]]
+                    await userbot.send_file(vid_chat, file=chunk, force_document=False)
 
             await status_msg.edit("Done!")
             return True
@@ -526,19 +621,23 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 shutil.rmtree(tmp_extract, ignore_errors=True)
 
     def _default_channel_for(fwd_message) -> Optional[str]:
-        """Return the configured default channel for the media type, or None."""
+        """Return the configured default channel for the media type, or None.
+
+        Resolution order: type-specific channel → DEFAULT_CHANNEL → None.
+        """
         media_type = get_media_type(fwd_message)
+        fallback = config.DEFAULT_CHANNEL or None
         if media_type == "photo":
-            return config.DEFAULT_IMAGE_CHANNEL or None
+            return config.DEFAULT_IMAGE_CHANNEL or fallback
         if media_type in ("video", "animation"):
-            return config.DEFAULT_VIDEO_CHANNEL or None
+            return config.DEFAULT_VIDEO_CHANNEL or fallback
         if media_type == "document":
             doc = getattr(fwd_message.media, "document", None)
             mime = getattr(doc, "mime_type", "") or ""
             if mime.startswith("image/"):
-                return config.DEFAULT_IMAGE_CHANNEL or None
-            return config.DEFAULT_VIDEO_CHANNEL or None
-        return None
+                return config.DEFAULT_IMAGE_CHANNEL or fallback
+            return config.DEFAULT_VIDEO_CHANNEL or fallback
+        return fallback
 
     # Register the forwarded-message handler last so /commands take priority
     @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
@@ -555,6 +654,18 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
         # ── Message with media ──────────────────────────────────────────────
         if event.media:
             fwd_message = event.message
+
+            # Albums: buffer all members and process together after a short delay
+            if event.message.grouped_id:
+                gid = event.message.grouped_id
+                _album_buffer.setdefault(gid, []).append(event.message)
+                old = _album_timers.get(gid)
+                if old:
+                    old.cancel()
+                _album_timers[gid] = asyncio.create_task(
+                    _process_album_after_delay(gid, sender_id)
+                )
+                return  # don't process individual member
 
             # Archives: extract and route contents to default channels
             if is_archive(fwd_message):
@@ -606,7 +717,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             if not text:
                 return
 
-            fwd_message = pending_forwards[sender_id]
+            stored = pending_forwards[sender_id]
             status_msg = await event.reply("Resolving target channel...")
 
             try:
@@ -615,6 +726,18 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 await status_msg.edit(f"Could not resolve target: {e}\nTry again with a different channel.")
                 return  # keep in pending_forwards so user can retry
 
+            # Album path
+            if isinstance(stored, list):
+                pending_forwards.pop(sender_id, None)
+                try:
+                    await _transfer_album_to_default(stored, text, status_msg)
+                except Exception as e:
+                    logger.error(f"Album transfer error: {e}", exc_info=True)
+                    await status_msg.edit(f"Error: {e}")
+                return
+
+            # Single-message path (existing logic)
+            fwd_message = stored
             fwd_from = fwd_message.fwd_from
             channel_id = getattr(fwd_from, "channel_id", None)
             channel_post = getattr(fwd_from, "channel_post", None)
