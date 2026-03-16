@@ -29,3 +29,6 @@ DOWNLOAD_WORKERS = int(os.environ.get("DOWNLOAD_WORKERS", "4"))
 UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "4"))
 # Number of independent MTProto TCP connections for parallel uploads
 SENDER_POOL_SIZE = int(os.environ.get("SENDER_POOL_SIZE", "4"))
+# Default target channels for auto-routing forwarded media (leave empty to ask each time)
+DEFAULT_IMAGE_CHANNEL = os.environ.get("DEFAULT_IMAGE_CHANNEL", "")
+DEFAULT_VIDEO_CHANNEL = os.environ.get("DEFAULT_VIDEO_CHANNEL", "")

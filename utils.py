@@ -52,7 +52,9 @@ def make_upload_progress_cb(label: str, log: logging.Logger, pct_step: int = 10)
 
 
 def retry_on_flood(max_retries: int = 3):
-    """Decorator that retries on FloodWaitError with exponential back-off."""
+    """Decorator that retries on FloodWaitError and transient network errors."""
+    _transient = (ConnectionError, TimeoutError, OSError)
+
     def decorator(func):
         @functools.wraps(func)
         async def wrapper(*args, **kwargs):
@@ -65,6 +67,15 @@ def retry_on_flood(max_retries: int = 3):
                     wait = e.seconds + 5
                     logger.warning(
                         f"FloodWait: sleeping {wait}s (attempt {attempt + 1}/{max_retries})"
+                    )
+                    await asyncio.sleep(wait)
+                except _transient as e:
+                    if attempt == max_retries - 1:
+                        raise
+                    wait = 2 ** attempt  # 1s, 2s, 4s
+                    logger.warning(
+                        f"Transient error {type(e).__name__}: {e}; "
+                        f"retrying in {wait}s (attempt {attempt + 1}/{max_retries})"
                     )
                     await asyncio.sleep(wait)
         return wrapper

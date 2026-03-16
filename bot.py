@@ -1,7 +1,9 @@
 import asyncio
 import io
 import logging
-from typing import Dict, Optional, Tuple
+import shutil
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Button
@@ -9,8 +11,10 @@ from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo,
 
 import config
 import database as db_module
+from archive import is_archive, extract_archive, classify_media
 from media import get_media_type, probe_extension
 from models import TransferStatus
+from telegraph import find_telegraph_urls, fetch_telegraph_page, download_telegraph_images
 from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk, transfer_bulk_files
 from utils import build_message_url
 
@@ -353,6 +357,189 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             logger.error(f"Resume start error: {e}", exc_info=True)
             await status_msg.edit(f"Error: {e}")
 
+    # ── helpers used by the forward handler ─────────────────────────────────
+
+    async def _transfer_to_default(fwd_message, target_ref: str, status_msg) -> bool:
+        """
+        Transfer *fwd_message* to the channel identified by *target_ref*.
+
+        Tries the original channel source first; falls back to direct download.
+        Returns True on success.
+        """
+        try:
+            target_chat = await resolve_chat(userbot, target_ref)
+        except Exception as e:
+            await status_msg.edit(f"Could not resolve default channel {target_ref!r}: {e}")
+            return False
+
+        fwd_from = fwd_message.fwd_from
+        channel_id = getattr(fwd_from, "channel_id", None)
+        channel_post = getattr(fwd_from, "channel_post", None)
+
+        if channel_id and channel_post:
+            await status_msg.edit("Fetching original message from source channel...")
+            source_ref = f"-100{channel_id}"
+            try:
+                source_chat = await resolve_chat(userbot, source_ref)
+                messages = await resolve_message(userbot, source_chat, channel_post)
+            except Exception:
+                messages = []
+
+            if messages:
+                source_url = build_message_url(source_chat, channel_post)
+                await status_msg.edit("Transferring...")
+                if len(messages) == 1:
+                    await transfer_one_message(userbot, messages[0], target_chat, source_url, cache=file_cache)
+                else:
+                    await transfer_album(userbot, messages, target_chat, source_url, cache=file_cache)
+                await status_msg.edit("Done!")
+                return True
+            # Fall through to direct download
+
+        await status_msg.edit("Downloading media...")
+        media_type = get_media_type(fwd_message)
+        buf = io.BytesIO()
+        await bot.download_media(fwd_message, file=buf)
+        buf.seek(0)
+        if hasattr(fwd_message.media, "document"):
+            for attr in getattr(fwd_message.media.document, "attributes", []):
+                if isinstance(attr, DocumentAttributeFilename):
+                    buf.name = attr.file_name
+                    break
+        if not getattr(buf, "name", None):
+            ext = await probe_extension(buf)
+            buf.name = f"file.{ext}"
+
+        await status_msg.edit("Uploading...")
+        if media_type == "photo":
+            await userbot.send_file(target_chat, file=buf, force_document=False)
+        elif media_type == "video":
+            video_attr = None
+            if hasattr(fwd_message.media, "document"):
+                for attr in getattr(fwd_message.media.document, "attributes", []):
+                    if isinstance(attr, DocumentAttributeVideo):
+                        video_attr = attr
+                        break
+            duration = getattr(video_attr, "duration", 0) or 0
+            w = getattr(video_attr, "w", 0) or 0
+            h = getattr(video_attr, "h", 0) or 0
+            await userbot.send_file(
+                target_chat, file=buf, force_document=False,
+                attributes=[DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
+            )
+        elif media_type == "voice":
+            await userbot.send_file(target_chat, file=buf, voice_note=True)
+        elif media_type == "video_note":
+            await userbot.send_file(target_chat, file=buf, video_note=True)
+        else:
+            await userbot.send_file(target_chat, file=buf, force_document=True)
+        await status_msg.edit("Done!")
+        return True
+
+    async def _handle_telegraph_urls(urls: List[str], status_msg) -> bool:
+        """Fetch Telegraph articles and upload images to DEFAULT_IMAGE_CHANNEL."""
+        if not config.DEFAULT_IMAGE_CHANNEL:
+            return False
+        try:
+            target_chat = await resolve_chat(userbot, config.DEFAULT_IMAGE_CHANNEL)
+        except Exception as e:
+            await status_msg.edit(f"Could not resolve DEFAULT_IMAGE_CHANNEL: {e}")
+            return False
+
+        for url in urls:
+            await status_msg.edit(f"Fetching Telegraph article…")
+            try:
+                title, _body, image_urls = await fetch_telegraph_page(url)
+            except Exception as e:
+                logger.warning(f"Could not fetch Telegraph page {url}: {e}")
+                continue
+
+            if not image_urls:
+                logger.info(f"No images in Telegraph article {url}")
+                continue
+
+            await status_msg.edit(f"Downloading {len(image_urls)} image(s) from {title!r}…")
+            bufs = await download_telegraph_images(image_urls)
+            if not bufs:
+                continue
+
+            caption = f"<b>{title}</b>\n{url}" if title else url
+
+            # Upload in albums of up to 10
+            for chunk_start in range(0, len(bufs), 10):
+                chunk = bufs[chunk_start:chunk_start + 10]
+                chunk_caption = caption if chunk_start == 0 else ""
+                await userbot.send_file(target_chat, file=chunk, caption=chunk_caption, parse_mode="html")
+
+        await status_msg.edit("Done!")
+        return True
+
+    async def _handle_archive(fwd_message, status_msg) -> bool:
+        """Download archive, extract, route images and videos to default channels."""
+        if not config.DEFAULT_IMAGE_CHANNEL and not config.DEFAULT_VIDEO_CHANNEL:
+            return False
+
+        tmp_archive = config.TEMP_DIR / f"archive_{fwd_message.id}"
+        tmp_extract = config.TEMP_DIR / f"extract_{fwd_message.id}"
+        try:
+            config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
+
+            # Determine filename
+            fname = f"archive_{fwd_message.id}"
+            doc = getattr(fwd_message.media, "document", None)
+            if doc:
+                for attr in getattr(doc, "attributes", []):
+                    if hasattr(attr, "file_name") and attr.file_name:
+                        fname = attr.file_name
+                        break
+            tmp_archive = config.TEMP_DIR / fname
+
+            await status_msg.edit("Downloading archive…")
+            await bot.download_media(fwd_message, file=str(tmp_archive))
+
+            await status_msg.edit("Extracting archive…")
+            await extract_archive(tmp_archive, tmp_extract)
+
+            images, videos = classify_media(tmp_extract)
+            logger.info(f"Archive contains {len(images)} images, {len(videos)} videos")
+
+            if images and config.DEFAULT_IMAGE_CHANNEL:
+                img_chat = await resolve_chat(userbot, config.DEFAULT_IMAGE_CHANNEL)
+                await status_msg.edit(f"Uploading {len(images)} image(s)…")
+                for chunk_start in range(0, len(images), 10):
+                    chunk = [str(p) for p in images[chunk_start:chunk_start + 10]]
+                    await userbot.send_file(img_chat, file=chunk)
+
+            if videos and config.DEFAULT_VIDEO_CHANNEL:
+                vid_chat = await resolve_chat(userbot, config.DEFAULT_VIDEO_CHANNEL)
+                for i, vpath in enumerate(videos, 1):
+                    await status_msg.edit(f"Uploading video {i}/{len(videos)}…")
+                    await userbot.send_file(vid_chat, file=str(vpath), force_document=False)
+
+            await status_msg.edit("Done!")
+            return True
+
+        finally:
+            if tmp_archive.exists():
+                tmp_archive.unlink(missing_ok=True)
+            if tmp_extract.exists():
+                shutil.rmtree(tmp_extract, ignore_errors=True)
+
+    def _default_channel_for(fwd_message) -> Optional[str]:
+        """Return the configured default channel for the media type, or None."""
+        media_type = get_media_type(fwd_message)
+        if media_type == "photo":
+            return config.DEFAULT_IMAGE_CHANNEL or None
+        if media_type in ("video", "animation"):
+            return config.DEFAULT_VIDEO_CHANNEL or None
+        if media_type == "document":
+            doc = getattr(fwd_message.media, "document", None)
+            mime = getattr(doc, "mime_type", "") or ""
+            if mime.startswith("image/"):
+                return config.DEFAULT_IMAGE_CHANNEL or None
+            return config.DEFAULT_VIDEO_CHANNEL or None
+        return None
+
     # Register the forwarded-message handler last so /commands take priority
     @bot.on(events.NewMessage(incoming=True, func=lambda e: e.is_private))
     async def handle_forwarded_or_target(event):
@@ -365,30 +552,69 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
         sender_id = event.sender_id
 
-        # Step 1: message with media (directly sent or forwarded) — store and ask for target
+        # ── Message with media ──────────────────────────────────────────────
         if event.media:
-            pending_forwards[sender_id] = event.message
+            fwd_message = event.message
+
+            # Archives: extract and route contents to default channels
+            if is_archive(fwd_message):
+                if config.DEFAULT_IMAGE_CHANNEL or config.DEFAULT_VIDEO_CHANNEL:
+                    status_msg = await event.reply("Processing archive…")
+                    try:
+                        await _handle_archive(fwd_message, status_msg)
+                    except Exception as e:
+                        logger.error(f"Archive handling error: {e}", exc_info=True)
+                        await status_msg.edit(f"Error: {e}")
+                    return
+                # No defaults — fall through to ask for target
+
+            # Non-archive media with a matching default channel → auto-route
+            default_ch = _default_channel_for(fwd_message)
+            if default_ch:
+                status_msg = await event.reply("Auto-routing to default channel…")
+                try:
+                    await _transfer_to_default(fwd_message, default_ch, status_msg)
+                except Exception as e:
+                    logger.error(f"Auto-route error: {e}", exc_info=True)
+                    await status_msg.edit(f"Error: {e}")
+                return
+
+            # No default channel configured — store and ask
+            pending_forwards[sender_id] = fwd_message
             await event.reply(
                 "Where should I send this? Reply with the channel username or URL."
             )
             return
 
+        # ── Plain text message ──────────────────────────────────────────────
+        text = (event.text or "").strip()
+
+        # Telegraph URL with no other media → fetch and upload images
+        if text and not (sender_id in pending_forwards):
+            telegraph_urls = find_telegraph_urls(text)
+            if telegraph_urls and config.DEFAULT_IMAGE_CHANNEL:
+                status_msg = await event.reply("Processing Telegraph article…")
+                try:
+                    await _handle_telegraph_urls(telegraph_urls, status_msg)
+                except Exception as e:
+                    logger.error(f"Telegraph handling error: {e}", exc_info=True)
+                    await status_msg.edit(f"Error: {e}")
+                return
+
         # Step 2: plain text reply while a forward is pending — treat as target
         if sender_id in pending_forwards:
-            target_ref = (event.text or "").strip()
-            if not target_ref:
+            if not text:
                 return
 
             fwd_message = pending_forwards[sender_id]
             status_msg = await event.reply("Resolving target channel...")
 
             try:
-                target_chat = await resolve_chat(userbot, target_ref)
+                target_chat = await resolve_chat(userbot, text)
             except Exception as e:
                 await status_msg.edit(f"Could not resolve target: {e}\nTry again with a different channel.")
                 return  # keep in pending_forwards so user can retry
 
-            # Determine source: if forwarded from a channel, use the original message via userbot
             fwd_from = fwd_message.fwd_from
             channel_id = getattr(fwd_from, "channel_id", None)
             channel_post = getattr(fwd_from, "channel_post", None)
@@ -421,7 +647,6 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 buf = io.BytesIO()
                 await bot.download_media(fwd_message, file=buf)
                 buf.seek(0)
-                # Set a filename so Telethon can infer MIME type from extension
                 if hasattr(fwd_message.media, "document"):
                     for attr in getattr(fwd_message.media.document, "attributes", []):
                         if isinstance(attr, DocumentAttributeFilename):

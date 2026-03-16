@@ -160,61 +160,62 @@ async def transfer_one_message(
     if mf is None:
         return None
 
+    ul_size = mf.path.stat().st_size
+    ul_timeout = max(config.OPERATION_TIMEOUT, ul_size // 524_288 + 120)
+
     try:
         pcb = make_upload_progress_cb(f"msg {message.id}", logger)
 
-        if media_type == "photo":
-            sent = await userbot.send_file(
-                target_chat, file=mf.path, caption=caption,
-                formatting_entities=message.entities,
-                force_document=False, progress_callback=pcb,
-            )
-
-        elif media_type == "video":
-            if needs_video_conversion(message):
-                logger.info(f"Converting non-H.264 video for message {message.id}")
-                mf.path = await convert_video(mf.path)
+        async def _do_upload():
+            if media_type == "photo":
+                return await userbot.send_file(
+                    target_chat, file=mf.path, caption=caption,
+                    formatting_entities=message.entities,
+                    force_document=False, progress_callback=pcb,
+                )
+            elif media_type == "video":
+                if needs_video_conversion(message):
+                    logger.info(f"Converting non-H.264 video for message {message.id}")
+                    mf.path = await convert_video(mf.path)
+                else:
+                    mf.path = await ensure_faststart(mf.path)
+                video_attr = _get_video_attr(message)
+                duration = getattr(video_attr, "duration", 0) or 0
+                w = getattr(video_attr, "w", 0) or 0
+                h = getattr(video_attr, "h", 0) or 0
+                return await userbot.send_file(
+                    target_chat, file=mf.path, caption=caption,
+                    formatting_entities=message.entities,
+                    force_document=False,
+                    attributes=[DocumentAttributeVideo(
+                        duration=duration, w=w, h=h, supports_streaming=True
+                    )],
+                    progress_callback=pcb,
+                )
+            elif media_type == "voice":
+                return await userbot.send_file(
+                    target_chat, file=mf.path, caption=caption,
+                    formatting_entities=message.entities,
+                    voice_note=True, progress_callback=pcb,
+                )
+            elif media_type == "video_note":
+                return await userbot.send_file(
+                    target_chat, file=mf.path, caption=caption,
+                    video_note=True, progress_callback=pcb,
+                )
+            elif media_type == "animation":
+                return await userbot.send_file(
+                    target_chat, file=mf.path, caption=caption,
+                    formatting_entities=message.entities, progress_callback=pcb,
+                )
             else:
-                mf.path = await ensure_faststart(mf.path)
-            video_attr = _get_video_attr(message)
-            duration = getattr(video_attr, "duration", 0) or 0
-            w = getattr(video_attr, "w", 0) or 0
-            h = getattr(video_attr, "h", 0) or 0
-            sent = await userbot.send_file(
-                target_chat, file=mf.path, caption=caption,
-                formatting_entities=message.entities,
-                force_document=False,
-                attributes=[DocumentAttributeVideo(
-                    duration=duration, w=w, h=h, supports_streaming=True
-                )],
-                progress_callback=pcb,
-            )
+                return await userbot.send_file(
+                    target_chat, file=mf.path, caption=caption,
+                    formatting_entities=message.entities,
+                    force_document=True, progress_callback=pcb,
+                )
 
-        elif media_type == "voice":
-            sent = await userbot.send_file(
-                target_chat, file=mf.path, caption=caption,
-                formatting_entities=message.entities,
-                voice_note=True, progress_callback=pcb,
-            )
-
-        elif media_type == "video_note":
-            sent = await userbot.send_file(
-                target_chat, file=mf.path, caption=caption,
-                video_note=True, progress_callback=pcb,
-            )
-
-        elif media_type == "animation":
-            sent = await userbot.send_file(
-                target_chat, file=mf.path, caption=caption,
-                formatting_entities=message.entities, progress_callback=pcb,
-            )
-
-        else:
-            sent = await userbot.send_file(
-                target_chat, file=mf.path, caption=caption,
-                formatting_entities=message.entities,
-                force_document=True, progress_callback=pcb,
-            )
+        sent = await asyncio.wait_for(_do_upload(), timeout=ul_timeout)
     finally:
         mf.cleanup()
 
@@ -509,10 +510,14 @@ async def transfer_bulk(
                                 timeout=ul_timeout,
                             )
                             if sent:
-                                for orig_msg in album_messages:
+                                final_msg_ids = {m.id for m in final_msgs}
+                                for orig_msg in final_msgs:
                                     pending_records.append((job_id, orig_msg.id, None))
                                     transferred_ids.add(orig_msg.id)
-                                transferred += len(album_messages)
+                                transferred += len(final_msgs)
+                                for msg in album_messages:
+                                    if msg.id not in final_msg_ids:
+                                        failed_ids.append(msg.id)
                         else:
                             failed_ids.append(album_messages[0].id)
                     else:
