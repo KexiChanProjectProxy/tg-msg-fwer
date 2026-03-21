@@ -838,21 +838,24 @@ async def _expand_telegraph(userbot: TelegramClient, text: str, target_chat) -> 
             header = f"**{title}**\n\n" if title else ""
             content_text = (header + body).strip()
 
-            images = await download_telegraph_images(image_urls)
+            image_files = await download_telegraph_images(image_urls)
 
-            if images:
-                # Send in batches of 10; attach text to the first batch only
-                for i in range(0, len(images), 10):
-                    batch = images[i : i + 10]
-                    caption = content_text if i == 0 else ""
-                    await userbot.send_file(
-                        target_chat,
-                        file=batch,
-                        caption=caption,
-                        progress_callback=make_upload_progress_cb(
-                            f"telegraph {url[-30:]}", logger
-                        ),
-                    )
+            if image_files:
+                try:
+                    for i in range(0, len(image_files), 10):
+                        batch = image_files[i : i + 10]
+                        caption = content_text if i == 0 else ""
+                        await userbot.send_file(
+                            target_chat,
+                            file=batch,
+                            caption=caption,
+                            progress_callback=make_upload_progress_cb(
+                                f"telegraph {url[-30:]}", logger
+                            ),
+                        )
+                finally:
+                    for image_file in image_files:
+                        image_file.unlink(missing_ok=True)
             elif content_text:
                 await userbot.send_message(target_chat, content_text)
 
@@ -1024,3 +1027,9 @@ async def _download_to_file(
         logger.error(f"Failed to download media for message {message.id}: {e}")
         tmp.unlink(missing_ok=True)
         return None
+
+
+async def download_to_file(
+    client: TelegramClient, message: Message, cache=None, on_progress=None
+) -> Optional[_MediaFile]:
+    return await _download_to_file(client, message, cache=cache, on_progress=on_progress)

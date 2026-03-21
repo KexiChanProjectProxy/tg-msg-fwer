@@ -1,13 +1,14 @@
-"""Telegraph article fetcher: find telegra.ph URLs, parse content, download images."""
-
 import asyncio
-import io
 import json
 import logging
 import re
 import urllib.parse
 import urllib.request
+import uuid
+from pathlib import Path
 from typing import List, Tuple
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -55,20 +56,20 @@ async def fetch_telegraph_page(url: str) -> Tuple[str, str, List[str]]:
     return title, body, image_urls
 
 
-async def download_telegraph_images(image_urls: List[str]) -> List[io.BytesIO]:
-    """Download Telegraph images concurrently. Skips any that fail."""
+async def download_telegraph_images(image_urls: List[str]) -> List[Path]:
     if not image_urls:
         return []
+    config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     loop = asyncio.get_event_loop()
     tasks = [loop.run_in_executor(None, _download_image, u) for u in image_urls]
     results = await asyncio.gather(*tasks, return_exceptions=True)
-    bufs = []
+    files = []
     for url, res in zip(image_urls, results):
         if isinstance(res, Exception):
             logger.warning(f"Failed to download Telegraph image {url}: {res}")
         else:
-            bufs.append(res)
-    return bufs
+            files.append(res)
+    return files
 
 
 # ── internal helpers ─────────────────────────────────────────────────────────
@@ -79,16 +80,25 @@ def _fetch_json(url: str) -> dict:
         return json.loads(resp.read().decode())
 
 
-def _download_image(url: str) -> io.BytesIO:
+def _download_image(url: str) -> Path:
     req = urllib.request.Request(url, headers={"User-Agent": "TelegramReload/1.0"})
-    with urllib.request.urlopen(req, timeout=60) as resp:
-        data = resp.read()
-    buf = io.BytesIO(data)
-    # Attach filename so Telethon picks the right MIME type
     filename = urllib.parse.urlparse(url).path.split("/")[-1]
-    if filename:
-        buf.name = filename
-    return buf
+    suffix = Path(filename).suffix if filename else ""
+    if not suffix:
+        suffix = ".bin"
+    out_path = config.TEMP_DIR / f"telegraph_{uuid.uuid4().hex}{suffix}"
+
+    try:
+        with urllib.request.urlopen(req, timeout=60) as resp, open(out_path, "wb") as out_file:
+            while True:
+                chunk = resp.read(64 * 1024)
+                if not chunk:
+                    break
+                out_file.write(chunk)
+        return out_path
+    except Exception:
+        out_path.unlink(missing_ok=True)
+        raise
 
 
 def _parse_nodes(nodes, text_parts: List[str], image_urls: List[str]) -> None:

@@ -1,21 +1,28 @@
 import asyncio
-import io
 import logging
+import re
 import shutil
-from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Union
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Button
-from telethon.tl.types import DocumentAttributeFilename, DocumentAttributeVideo, Message
+from telethon.tl.types import DocumentAttributeVideo, Message
 
 import config
 import database as db_module
 from archive import is_archive, extract_archive, classify_media
-from media import get_media_type, probe_extension
+from media import get_media_type
 from models import TransferStatus
 from telegraph import find_telegraph_urls, fetch_telegraph_page, download_telegraph_images
-from transfer import resolve_chat, resolve_message, transfer_one_message, transfer_album, transfer_bulk, transfer_bulk_files
+from transfer import (
+    download_to_file,
+    resolve_chat,
+    resolve_message,
+    transfer_one_message,
+    transfer_album,
+    transfer_bulk,
+    transfer_bulk_files,
+)
 from utils import build_message_url
 
 logger = logging.getLogger(__name__)
@@ -401,42 +408,47 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             # Fall through to direct download
 
         await status_msg.edit("Downloading media...")
-        media_type = get_media_type(fwd_message)
-        buf = io.BytesIO()
-        await bot.download_media(fwd_message, file=buf)
-        buf.seek(0)
-        if hasattr(fwd_message.media, "document"):
-            for attr in getattr(fwd_message.media.document, "attributes", []):
-                if isinstance(attr, DocumentAttributeFilename):
-                    buf.name = attr.file_name
-                    break
-        if not getattr(buf, "name", None):
-            ext = await probe_extension(buf)
-            buf.name = f"file.{ext}"
+        mf = await download_to_file(bot, fwd_message, cache=file_cache)
+        if mf is None:
+            raise RuntimeError("Failed to download forwarded media")
 
-        await status_msg.edit("Uploading...")
-        if media_type == "photo":
-            await userbot.send_file(target_chat, file=buf, force_document=False)
-        elif media_type == "video":
-            video_attr = None
-            if hasattr(fwd_message.media, "document"):
-                for attr in getattr(fwd_message.media.document, "attributes", []):
-                    if isinstance(attr, DocumentAttributeVideo):
-                        video_attr = attr
-                        break
-            duration = getattr(video_attr, "duration", 0) or 0
-            w = getattr(video_attr, "w", 0) or 0
-            h = getattr(video_attr, "h", 0) or 0
-            await userbot.send_file(
-                target_chat, file=buf, force_document=False,
-                attributes=[DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
-            )
-        elif media_type == "voice":
-            await userbot.send_file(target_chat, file=buf, voice_note=True)
-        elif media_type == "video_note":
-            await userbot.send_file(target_chat, file=buf, video_note=True)
-        else:
-            await userbot.send_file(target_chat, file=buf, force_document=True)
+        try:
+            await status_msg.edit("Uploading...")
+            media_type = get_media_type(fwd_message)
+            if media_type == "photo":
+                await userbot.send_file(target_chat, file=mf.path, force_document=False)
+            elif media_type == "video":
+                video_attr = None
+                if hasattr(fwd_message.media, "document"):
+                    for attr in getattr(fwd_message.media.document, "attributes", []):
+                        if isinstance(attr, DocumentAttributeVideo):
+                            video_attr = attr
+                            break
+                duration = getattr(video_attr, "duration", 0) or 0
+                w = getattr(video_attr, "w", 0) or 0
+                h = getattr(video_attr, "h", 0) or 0
+                await userbot.send_file(
+                    target_chat,
+                    file=mf.path,
+                    force_document=False,
+                    attributes=[
+                        DocumentAttributeVideo(
+                            duration=duration,
+                            w=w,
+                            h=h,
+                            supports_streaming=True,
+                        )
+                    ],
+                )
+            elif media_type == "voice":
+                await userbot.send_file(target_chat, file=mf.path, voice_note=True)
+            elif media_type == "video_note":
+                await userbot.send_file(target_chat, file=mf.path, video_note=True)
+            else:
+                await userbot.send_file(target_chat, file=mf.path, force_document=True)
+        finally:
+            mf.cleanup()
+
         await status_msg.edit("Done!")
         return True
 
@@ -480,23 +492,24 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
         # Fallback: download all members from bot, send as grouped album
         await status_msg.edit(f"Downloading {len(album_messages)} media file(s)...")
-        bufs = []
-        for msg in album_messages:
-            buf = io.BytesIO()
-            await bot.download_media(msg, file=buf)
-            buf.seek(0)
-            if hasattr(msg.media, "document"):
-                for attr in getattr(msg.media.document, "attributes", []):
-                    if isinstance(attr, DocumentAttributeFilename):
-                        buf.name = attr.file_name
-                        break
-            if not getattr(buf, "name", None):
-                ext = await probe_extension(buf)
-                buf.name = f"file.{ext}"
-            bufs.append(buf)
+        media_files = []
+        try:
+            for msg in album_messages:
+                mf = await download_to_file(bot, msg, cache=file_cache)
+                if mf is None:
+                    raise RuntimeError(f"Failed to download album member {msg.id}")
+                media_files.append(mf)
 
-        await status_msg.edit("Uploading album...")
-        await userbot.send_file(target_chat, file=bufs, force_document=False)
+            await status_msg.edit("Uploading album...")
+            await userbot.send_file(
+                target_chat,
+                file=[mf.path for mf in media_files],
+                force_document=False,
+            )
+        finally:
+            for mf in media_files:
+                mf.cleanup()
+
         await status_msg.edit("Done!")
         return True
 
@@ -553,17 +566,25 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 continue
 
             await status_msg.edit(f"Downloading {len(image_urls)} image(s) from {title!r}…")
-            bufs = await download_telegraph_images(image_urls)
-            if not bufs:
+            image_files = await download_telegraph_images(image_urls)
+            if not image_files:
                 continue
 
             caption = f"<b>{title}</b>\n{url}" if title else url
 
-            # Upload in albums of up to 10
-            for chunk_start in range(0, len(bufs), 10):
-                chunk = bufs[chunk_start:chunk_start + 10]
-                chunk_caption = caption if chunk_start == 0 else ""
-                await userbot.send_file(target_chat, file=chunk, caption=chunk_caption, parse_mode="html")
+            try:
+                for chunk_start in range(0, len(image_files), 10):
+                    chunk = image_files[chunk_start:chunk_start + 10]
+                    chunk_caption = caption if chunk_start == 0 else ""
+                    await userbot.send_file(
+                        target_chat,
+                        file=chunk,
+                        caption=chunk_caption,
+                        parse_mode="html",
+                    )
+            finally:
+                for image_file in image_files:
+                    image_file.unlink(missing_ok=True)
 
         await status_msg.edit("Done!")
         return True
@@ -712,6 +733,53 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                     await status_msg.edit(f"Error: {e}")
                 return
 
+        # t.me message links → auto-fetch and route to default channel
+        if text and not (sender_id in pending_forwards):
+            message_links = find_message_urls(text)
+            if message_links:
+                status_msg = await event.reply("Processing message link…")
+                for chat_ref, msg_id in message_links:
+                    try:
+                        try:
+                            source_chat = await resolve_chat(userbot, chat_ref)
+                        except Exception as e:
+                            await status_msg.edit(
+                                f"Cannot access channel {chat_ref!r}. "
+                                "The userbot may need to join it first."
+                            )
+                            continue
+
+                        messages = await resolve_message(userbot, source_chat, msg_id)
+                        if not messages:
+                            await status_msg.edit(f"Message {msg_id} not found in {chat_ref!r}.")
+                            continue
+
+                        target = _default_channel_for(messages[0]) or config.DEFAULT_CHANNEL
+                        if not target:
+                            pending_forwards[sender_id] = messages
+                            await event.reply(
+                                "No default channel configured. "
+                                "Reply with a target channel username or URL."
+                            )
+                            return
+
+                        target_chat = await resolve_chat(userbot, target)
+                        url = build_message_url(source_chat, msg_id)
+                        await status_msg.edit("Transferring…")
+                        if len(messages) == 1:
+                            await transfer_one_message(
+                                userbot, messages[0], target_chat, url, cache=file_cache
+                            )
+                        else:
+                            await transfer_album(
+                                userbot, messages, target_chat, url, cache=file_cache
+                            )
+                        await status_msg.edit("Done!")
+                    except Exception as e:
+                        logger.error(f"Link transfer error: {e}", exc_info=True)
+                        await status_msg.edit(f"Error: {e}")
+                return
+
         # Step 2: plain text reply while a forward is pending — treat as target
         if sender_id in pending_forwards:
             if not text:
@@ -766,42 +834,47 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
 
                 # Direct download from the bot's copy of the forwarded message
                 await status_msg.edit("Downloading media...")
-                media_type = get_media_type(fwd_message)
-                buf = io.BytesIO()
-                await bot.download_media(fwd_message, file=buf)
-                buf.seek(0)
-                if hasattr(fwd_message.media, "document"):
-                    for attr in getattr(fwd_message.media.document, "attributes", []):
-                        if isinstance(attr, DocumentAttributeFilename):
-                            buf.name = attr.file_name
-                            break
-                if not getattr(buf, "name", None):
-                    ext = await probe_extension(buf)
-                    buf.name = f"file.{ext}"
+                mf = await download_to_file(bot, fwd_message, cache=file_cache)
+                if mf is None:
+                    raise RuntimeError("Failed to download forwarded media")
 
-                await status_msg.edit("Uploading to target channel...")
-                if media_type == "photo":
-                    await userbot.send_file(target_chat, file=buf, force_document=False)
-                elif media_type == "video":
-                    video_attr = None
-                    if hasattr(fwd_message.media, "document"):
-                        for attr in getattr(fwd_message.media.document, "attributes", []):
-                            if isinstance(attr, DocumentAttributeVideo):
-                                video_attr = attr
-                                break
-                    duration = getattr(video_attr, "duration", 0) or 0
-                    w = getattr(video_attr, "w", 0) or 0
-                    h = getattr(video_attr, "h", 0) or 0
-                    await userbot.send_file(
-                        target_chat, file=buf, force_document=False,
-                        attributes=[DocumentAttributeVideo(duration=duration, w=w, h=h, supports_streaming=True)],
-                    )
-                elif media_type == "voice":
-                    await userbot.send_file(target_chat, file=buf, voice_note=True)
-                elif media_type == "video_note":
-                    await userbot.send_file(target_chat, file=buf, video_note=True)
-                else:
-                    await userbot.send_file(target_chat, file=buf, force_document=True)
+                try:
+                    await status_msg.edit("Uploading to target channel...")
+                    media_type = get_media_type(fwd_message)
+                    if media_type == "photo":
+                        await userbot.send_file(target_chat, file=mf.path, force_document=False)
+                    elif media_type == "video":
+                        video_attr = None
+                        if hasattr(fwd_message.media, "document"):
+                            for attr in getattr(fwd_message.media.document, "attributes", []):
+                                if isinstance(attr, DocumentAttributeVideo):
+                                    video_attr = attr
+                                    break
+                        duration = getattr(video_attr, "duration", 0) or 0
+                        w = getattr(video_attr, "w", 0) or 0
+                        h = getattr(video_attr, "h", 0) or 0
+                        await userbot.send_file(
+                            target_chat,
+                            file=mf.path,
+                            force_document=False,
+                            attributes=[
+                                DocumentAttributeVideo(
+                                    duration=duration,
+                                    w=w,
+                                    h=h,
+                                    supports_streaming=True,
+                                )
+                            ],
+                        )
+                    elif media_type == "voice":
+                        await userbot.send_file(target_chat, file=mf.path, voice_note=True)
+                    elif media_type == "video_note":
+                        await userbot.send_file(target_chat, file=mf.path, video_note=True)
+                    else:
+                        await userbot.send_file(target_chat, file=mf.path, force_document=True)
+                finally:
+                    mf.cleanup()
+
                 pending_forwards.pop(sender_id, None)
                 await status_msg.edit("Done!")
 
@@ -810,19 +883,49 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 await status_msg.edit(f"Error: {e}\nTry again with a different channel.")
 
 
+_TME_RE = re.compile(
+    r'(?:https?://)?(?:www\.)?t\.me/'
+    r'(?:c/(\d+)|([a-zA-Z_]\w{3,}))'
+    r'/(\d+)'
+)
+
+
 def _parse_message_url(url: str):
-    """Parse a t.me message URL into (chat_ref, msg_id)."""
+    """Parse a t.me message URL into (chat_ref, msg_id).
+
+    Handles https://, http://, www., trailing query params and slashes,
+    and both t.me/c/<id>/<msgid> (private) and t.me/<username>/<msgid> (public).
+    """
+    m = _TME_RE.search(url)
+    if not m:
+        return None, None
+    channel_id, username, msg_id_str = m.group(1), m.group(2), m.group(3)
     try:
-        url = url.strip("/")
-        if "t.me/c/" in url:
-            parts = url.split("t.me/c/")[1].split("/")
-            return f"-100{parts[0]}", int(parts[1])
-        elif "t.me/" in url:
-            parts = url.split("t.me/")[1].split("/")
-            return parts[0], int(parts[1])
-    except (IndexError, ValueError):
-        pass
-    return None, None
+        msg_id = int(msg_id_str)
+    except (TypeError, ValueError):
+        return None, None
+    if channel_id:
+        return f"-100{channel_id}", msg_id
+    return username, msg_id
+
+
+def find_message_urls(text: str) -> List[Tuple[str, int]]:
+    """Scan *text* and return all (chat_ref, msg_id) tuples found.
+
+    Parallels find_telegraph_urls(); uses _TME_RE.finditer().
+    """
+    results = []
+    for m in _TME_RE.finditer(text):
+        channel_id, username, msg_id_str = m.group(1), m.group(2), m.group(3)
+        try:
+            msg_id = int(msg_id_str)
+        except (TypeError, ValueError):
+            continue
+        if channel_id:
+            results.append((f"-100{channel_id}", msg_id))
+        else:
+            results.append((username, msg_id))
+    return results
 
 
 def _format_job(job) -> str:
