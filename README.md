@@ -46,9 +46,12 @@ All configuration is via environment variables (or a `.env` file).
 | `DB_PATH` | `telegram_reload.db` | SQLite database file path |
 | `TRANSFER_DELAY` | `1.5` | Seconds between transfers (±0.5 s jitter applied automatically) |
 | `IS_PREMIUM` | _(empty)_ | Set to any non-empty value if the userbot has Telegram Premium (enables >2 GB uploads) |
-| `CONCURRENT_TRANSFERS` | `3` | Producer-consumer queue depth for bulk transfers |
+| `CONCURRENT_TRANSFERS` | `3` | Max prepared transfers that can be staged in the bounded `transfer_bulk()` queue between download/prepare work and upload work. This is a queue limit, not a direct worker count. |
 | `CACHE_DIR` | `cache` | Directory for the LRU disk cache |
 | `MAX_CACHE_SIZE` | `1073741824` | Maximum cache size in bytes (default 1 GB) |
+| `MAX_INFLIGHT_BYTES` | `1073741824` | Dedicated bulk-transfer staging budget in bytes for prepared temp media. It is configured separately from cache eviction, even though the default still falls back to `MAX_CACHE_SIZE` when unset. |
+| `UPLOAD_WORKERS` | `4` | Per-file parallel upload part workers for large uploads. Effective upload lanes are still capped by sender-pool capacity. |
+| `SENDER_POOL_SIZE` | `4` | Number of MTProto sender connections available for upload fanout. Effective upload concurrency is clamped to this ceiling when a sender pool is active; otherwise uploads fall back to the main sender. |
 
 ## First run
 
@@ -65,8 +68,10 @@ On first run the userbot will prompt for your phone number and the one-time code
 | `/start` | Show the welcome menu |
 | `/transfer <url> <target>` | Transfer a single message |
 | `/bulk <source> <target>` | Transfer an entire channel |
+| `/bulkfiles <source> <target>` | Transfer media-only messages (oldest first) |
 | `/status [job_id]` | Show job progress (last 5 jobs if no ID given) |
 | `/cancel <job_id>` | Cancel a running bulk job |
+| `/resume <job_id>` | Resume an interrupted or failed job |
 | `/help` | Show command reference |
 
 ### Chat references
@@ -83,8 +88,10 @@ On first run the userbot will prompt for your phone number and the one-time code
 ```
 /transfer https://t.me/somechannel/42 @mychannel
 /bulk @sourcechannel @targetchannel
+/bulkfiles @sourcechannel @targetchannel
 /status 3
 /cancel 3
+/resume 3
 ```
 
 ## Forwarding a message
@@ -111,7 +118,7 @@ main.py          entry point: init DB, start both clients, register handlers
 ├── bot.py       bot command & message handlers; admin whitelist; forward flow
 ├── userbot.py   userbot event handlers (extend as needed)
 ├── transfer.py  resolve_chat / resolve_message / transfer_one_message /
-│                transfer_album / transfer_bulk / _download_to_bytes (with cache)
+│                transfer_album / transfer_bulk / _download_to_file (with cache)
 ├── cache.py     FileCache — LRU disk cache with asyncio.Lock
 ├── media.py     get_media_type / needs_video_conversion / convert_video /
 │                ensure_faststart (ffmpeg wrappers)
@@ -129,7 +136,20 @@ Two Telethon clients run concurrently on the same event loop:
 
 ### Bulk transfer pipeline
 
-`transfer_bulk` uses a bounded producer-consumer queue (`asyncio.Queue`) so that downloading message N+1 overlaps with uploading message N. The queue depth is `CONCURRENT_TRANSFERS`. Progress and transferred message IDs are flushed to SQLite every 20 messages, enabling resume after a crash or cancellation.
+`transfer_bulk` uses a bounded producer-consumer queue (`asyncio.Queue(maxsize=CONCURRENT_TRANSFERS)`) so that downloading message N+1 overlaps with uploading message N without allowing unbounded queued work. Prepared media also reserves from the dedicated `MAX_INFLIGHT_BYTES` staging budget before enqueue, which limits how much disk-backed temp media can pile up even if the cache itself is larger. Upload fanout uses `UPLOAD_WORKERS`, but the effective lane count is still capped by `SENDER_POOL_SIZE` when a sender pool is active. Progress and transferred message IDs are flushed to SQLite every 20 messages, enabling resume after a crash or cancellation.
+
+### Synthetic benchmark protocol
+
+The benchmark harness is local and synthetic on purpose: it copies files through a temporary disk-backed producer/consumer pipeline that mirrors the queue, inflight-budget, and upload-lane controls without claiming real Telegram WAN throughput.
+
+```bash
+python -m benchmarks.transfer_perf --scenario matrix --output .sisyphus/evidence/task-9-benchmark.json
+python -m benchmarks.transfer_perf --scenario cleanup --output .sisyphus/evidence/task-9-cleanup.json
+```
+
+- `matrix` emits machine-readable case results for `upload_large_single`, `upload_album`, `upload_many_small`, `budget_saturation`, and `cleanup`.
+- Each JSON result records scenario metadata, bytes transferred, elapsed seconds, MB/s, peak RSS, cleanup status, and residue counts.
+- These numbers are useful for repeatable local regression checks of queue/budget/cleanup behavior; they are not measurements of real Telegram throughput.
 
 ### Resume behaviour
 
