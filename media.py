@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import uuid
 from pathlib import Path
+from typing import Optional
 
 from telethon.tl.types import (
     MessageMediaPhoto,
@@ -161,9 +162,48 @@ async def probe_extension(buf: io.BytesIO) -> str:
         return ext
 
     loop = asyncio.get_event_loop()
-    ext = await loop.run_in_executor(None, _probe_extension_sync, buf.read())
+    ext = await loop.run_in_executor(None, _probe_extension_via_file_sync, buf)
     buf.seek(0)
     return ext
+
+
+def _buffer_backing_path(buf: io.BytesIO) -> Optional[Path]:
+    name = getattr(buf, "name", None)
+    if not name:
+        return None
+    try:
+        path = Path(name)
+    except (TypeError, ValueError):
+        return None
+    if path.is_file():
+        return path
+    return None
+
+
+def _probe_extension_via_file_sync(buf: io.BytesIO) -> str:
+    backing_path = _buffer_backing_path(buf)
+    if backing_path is not None:
+        return _probe_file_sync(backing_path)
+
+    tmp_path: Optional[Path] = None
+    original_pos = buf.tell()
+    try:
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".bin") as tmp:
+            tmp_path = Path(tmp.name)
+            buf.seek(0)
+            while True:
+                chunk = buf.read(1024 * 1024)
+                if not chunk:
+                    break
+                tmp.write(chunk)
+        return _probe_file_sync(tmp_path)
+    finally:
+        try:
+            buf.seek(original_pos)
+        except Exception:
+            buf.seek(0)
+        if tmp_path is not None:
+            tmp_path.unlink(missing_ok=True)
 
 
 def _probe_extension_sync(data: bytes) -> str:
@@ -309,5 +349,3 @@ def _ensure_faststart_sync(path: Path) -> Path:
         logger.warning(f"ensure_faststart exception: {e}, using original")
         out_path.unlink(missing_ok=True)
         return path
-
-
