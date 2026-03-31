@@ -7,6 +7,7 @@ import time
 import uuid
 from dataclasses import dataclass
 from pathlib import Path
+from types import SimpleNamespace
 from typing import List, Optional, Set, Tuple
 
 from telethon import TelegramClient, utils as tl_utils
@@ -38,6 +39,30 @@ logger = logging.getLogger(__name__)
 _MAX_FILE_SIZE = 4 * 1024 ** 3 if config.IS_PREMIUM else 2 * 1024 ** 3
 
 
+def _sender_pool_capacity(sender_pool) -> Optional[int]:
+    if sender_pool is None:
+        return None
+
+    senders = getattr(sender_pool, "_senders", None)
+    if isinstance(senders, list) and senders:
+        return len(senders)
+
+    for attr in ("capacity", "_pool_size", "pool_size"):
+        value = getattr(sender_pool, attr, None)
+        if isinstance(value, int) and value > 0:
+            return value
+
+    return None
+
+
+def _effective_upload_workers(requested_workers: int, sender_pool=None) -> int:
+    workers = max(1, int(requested_workers or 1))
+    capacity = _sender_pool_capacity(sender_pool)
+    if capacity is not None:
+        workers = min(workers, capacity)
+    return max(1, workers)
+
+
 async def _iter_with_timeout(async_iter, timeout):
     """Wrap an async iterator so each __anext__() call has a per-item timeout."""
     while True:
@@ -56,6 +81,24 @@ class _MediaFile:
     def cleanup(self) -> None:
         if self.owned:
             self.path.unlink(missing_ok=True)
+
+
+def _replace_media_path(mf: _MediaFile, new_path: Path) -> None:
+    old_path = mf.path
+    mf.path = new_path
+    if mf.owned and new_path != old_path:
+        old_path.unlink(missing_ok=True)
+
+
+def wrap_local_media_files(paths: List[Path], *, owned: bool = False) -> List[_MediaFile]:
+    return [_MediaFile(Path(path), owned=owned) for path in paths]
+
+
+def build_caption_messages(captions: List[str]):
+    return [
+        SimpleNamespace(id=index, message=caption, entities=[], media=object(), action=None)
+        for index, caption in enumerate(captions)
+    ]
 
 
 async def resolve_chat(userbot: TelegramClient, chat_ref: str):
@@ -135,9 +178,8 @@ async def transfer_one_message(
         logger.info(f"Skipping poll message {message.id}")
         return None
 
-    caption = _build_caption(message.message or "", source_url)
-
     if not message.media:
+        caption = _build_caption(message.message or "", source_url)
         sent = await userbot.send_message(
             target_chat,
             message=caption,
@@ -160,66 +202,18 @@ async def transfer_one_message(
     if mf is None:
         return None
 
-    ul_size = mf.path.stat().st_size
-    ul_timeout = max(config.OPERATION_TIMEOUT, ul_size // 524_288 + 120)
-
     try:
-        pcb = make_upload_progress_cb(f"msg {message.id}", logger)
-
-        async def _do_upload():
-            if media_type == "photo":
-                return await userbot.send_file(
-                    target_chat, file=mf.path, caption=caption,
-                    formatting_entities=message.entities,
-                    force_document=False, progress_callback=pcb,
-                )
-            elif media_type == "video":
-                if needs_video_conversion(message):
-                    logger.info(f"Converting non-H.264 video for message {message.id}")
-                    mf.path = await convert_video(mf.path)
-                else:
-                    mf.path = await ensure_faststart(mf.path)
-                video_attr = _get_video_attr(message)
-                duration = getattr(video_attr, "duration", 0) or 0
-                w = getattr(video_attr, "w", 0) or 0
-                h = getattr(video_attr, "h", 0) or 0
-                return await userbot.send_file(
-                    target_chat, file=mf.path, caption=caption,
-                    formatting_entities=message.entities,
-                    force_document=False,
-                    attributes=[DocumentAttributeVideo(
-                        duration=duration, w=w, h=h, supports_streaming=True
-                    )],
-                    progress_callback=pcb,
-                )
-            elif media_type == "voice":
-                return await userbot.send_file(
-                    target_chat, file=mf.path, caption=caption,
-                    formatting_entities=message.entities,
-                    voice_note=True, progress_callback=pcb,
-                )
-            elif media_type == "video_note":
-                return await userbot.send_file(
-                    target_chat, file=mf.path, caption=caption,
-                    video_note=True, progress_callback=pcb,
-                )
-            elif media_type == "animation":
-                return await userbot.send_file(
-                    target_chat, file=mf.path, caption=caption,
-                    formatting_entities=message.entities, progress_callback=pcb,
-                )
-            else:
-                return await userbot.send_file(
-                    target_chat, file=mf.path, caption=caption,
-                    formatting_entities=message.entities,
-                    force_document=True, progress_callback=pcb,
-                )
-
-        sent = await asyncio.wait_for(_do_upload(), timeout=ul_timeout)
+        sent = await upload_downloaded_message(
+            userbot,
+            message,
+            mf,
+            target_chat,
+            source_url=source_url,
+            media_type=media_type,
+        )
     finally:
         mf.cleanup()
 
-    await _expand_telegraph(userbot, message.message, target_chat)
     return sent
 
 
@@ -256,24 +250,79 @@ async def transfer_album(
     if not mfs:
         return None
 
-    captions = []
-    for i, msg in enumerate(valid_messages):
-        if i == len(valid_messages) - 1:
-            captions.append(_build_caption(msg.message or "", source_url))
-        else:
-            captions.append(msg.message or "")
-
     first_id = messages[0].id
     try:
-        sent = await userbot.send_file(
+        sent = await upload_downloaded_album(
+            userbot,
+            valid_messages,
+            mfs,
             target_chat,
-            file=[mf.path for mf in mfs],
-            caption=captions,
-            progress_callback=make_upload_progress_cb(f"album msg {first_id}", logger),
+            source_url=source_url,
+            progress_cb=make_upload_progress_cb(f"album msg {first_id}", logger),
         )
     finally:
         for mf in mfs:
             mf.cleanup()
+    return sent if isinstance(sent, list) else [sent]
+
+
+async def upload_downloaded_message(
+    userbot: TelegramClient,
+    message: Message,
+    mf: _MediaFile,
+    target_chat,
+    source_url: Optional[str] = None,
+    media_type: Optional[str] = None,
+    progress_cb=None,
+    sender_pool=None,
+) -> Optional[Message]:
+    ul_size = mf.path.stat().st_size
+    ul_timeout = max(config.OPERATION_TIMEOUT, ul_size // 524_288 + 120)
+    if progress_cb is None:
+        progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
+    return await asyncio.wait_for(
+        _upload_prepared(
+            userbot,
+            message,
+            mf,
+            target_chat,
+            source_url=source_url,
+            media_type=media_type,
+            progress_cb=progress_cb,
+            sender_pool=sender_pool,
+        ),
+        timeout=ul_timeout,
+    )
+
+
+async def upload_downloaded_album(
+    userbot: TelegramClient,
+    messages: List[Message],
+    media_files: List[_MediaFile],
+    target_chat,
+    source_url: Optional[str] = None,
+    progress_cb=None,
+    force_document: Optional[bool] = None,
+) -> Optional[List[Message]]:
+    if not messages or not media_files:
+        return None
+
+    captions = []
+    for i, msg in enumerate(messages):
+        if source_url and i == len(messages) - 1:
+            captions.append(_build_caption(msg.message or "", source_url))
+        else:
+            captions.append(msg.message or "")
+
+    send_kwargs = {
+        "file": [mf.path for mf in media_files],
+        "caption": captions,
+        "progress_callback": progress_cb,
+    }
+    if force_document is not None:
+        send_kwargs["force_document"] = force_document
+
+    sent = await userbot.send_file(target_chat, **send_kwargs)
     return sent if isinstance(sent, list) else [sent]
 
 
@@ -325,8 +374,8 @@ async def transfer_bulk(
         db, _job.source_chat, _job.target_chat
     )
 
-    byte_budget = ByteBudget(cfg.MAX_CACHE_SIZE)
-    upload_queue: asyncio.Queue = asyncio.Queue()
+    byte_budget = ByteBudget(cfg.MAX_INFLIGHT_BYTES)
+    upload_queue: asyncio.Queue = asyncio.Queue(maxsize=cfg.CONCURRENT_TRANSFERS)
 
     transferred = 0
     failed_ids: List[int] = []
@@ -350,6 +399,31 @@ async def transfer_bulk(
         if pending_records:
             await db_module.record_transfers_batch(db, pending_records)
             pending_records = []
+
+    async def _cleanup_queued_items():
+        while True:
+            try:
+                item = upload_queue.get_nowait()
+            except asyncio.QueueEmpty:
+                break
+
+            try:
+                if item is None:
+                    continue
+
+                kind = item[0]
+                if kind == "album":
+                    _, _album_messages, _valid_msgs, mfs, _source_url, bytes_held = item
+                    for mf in (mfs or []):
+                        mf.cleanup()
+                    await byte_budget.release(bytes_held)
+                elif kind == "single":
+                    _, _message, mf, _source_url, bytes_held = item
+                    if mf:
+                        mf.cleanup()
+                    await byte_budget.release(bytes_held)
+            finally:
+                upload_queue.task_done()
 
     async def _producer():
         """Iterate messages, skip already-done ones, download media, enqueue individually."""
@@ -470,15 +544,32 @@ async def transfer_bulk(
                 _, album_messages, valid_msgs, mfs, source_url, bytes_held = item
                 try:
                     if mfs:
-                        # Pre-upload each album file via sender pool concurrently
-                        pre_handles = await asyncio.gather(*[
-                            _upload_file_parallel(
-                                userbot, mf.path, config.UPLOAD_WORKERS,
-                                sender_pool=_sender_pool,
-                                on_progress=_make_progress_cb(f"album-pre {valid_msgs[i].id}"),
-                            )
-                            for i, mf in enumerate(mfs)
-                        ], return_exceptions=True)
+                        lane_ceiling = _effective_upload_workers(
+                            config.UPLOAD_WORKERS, sender_pool=_sender_pool
+                        )
+                        parallel_files = min(len(mfs), lane_ceiling)
+                        workers_per_file = max(1, lane_ceiling // parallel_files)
+                        fanout_sem = asyncio.Semaphore(parallel_files)
+
+                        async def _preupload_album_member(i: int, mf: _MediaFile):
+                            async with fanout_sem:
+                                return await _upload_file_parallel(
+                                    userbot,
+                                    mf.path,
+                                    workers_per_file,
+                                    sender_pool=_sender_pool,
+                                    on_progress=_make_progress_cb(
+                                        f"album-pre {valid_msgs[i].id}"
+                                    ),
+                                )
+
+                        pre_handles = await asyncio.gather(
+                            *[
+                                _preupload_album_member(i, mf)
+                                for i, mf in enumerate(mfs)
+                            ],
+                            return_exceptions=True,
+                        )
 
                         final_handles = []
                         final_msgs = []
@@ -646,6 +737,7 @@ async def transfer_bulk(
         finally:
             watchdog_task.cancel()
     finally:
+        await _cleanup_queued_items()
         await _flush_records()
         final_status = "cancelled" if cancel_event.is_set() else "done"
         await db_module.update_job(
@@ -679,7 +771,10 @@ async def _upload_file_parallel(
     PART_SIZE = 512 * 1024  # 512 KB — maximum allowed by Telegram
     part_count = (file_size + PART_SIZE - 1) // PART_SIZE
     file_id = int.from_bytes(os.urandom(8), "little", signed=True)
-    workers = min(n_workers, part_count)
+    workers = min(
+        _effective_upload_workers(n_workers, sender_pool=sender_pool),
+        part_count,
+    )
     uploaded = [0]
 
     async def _upload_worker(worker_id: int) -> None:
@@ -714,6 +809,7 @@ async def _upload_prepared(
     mf: Optional[_MediaFile],
     target_chat,
     source_url: str,
+    media_type: Optional[str] = None,
     progress_cb=None,
     sender_pool=None,
 ) -> Optional[Message]:
@@ -726,7 +822,7 @@ async def _upload_prepared(
     if isinstance(message.media, MessageMediaPoll):
         return None
 
-    caption = _build_caption(message.message or "", source_url)
+    caption = _build_caption(message.message or "", source_url) if source_url else (message.message or "")
 
     if mf is None:
         sent = await userbot.send_message(
@@ -737,20 +833,26 @@ async def _upload_prepared(
         await _expand_telegraph(userbot, message.message, target_chat)
         return sent
 
-    media_type = get_media_type(message)
+    if media_type is None:
+        media_type = get_media_type(message)
     if progress_cb is None:
         progress_cb = make_upload_progress_cb(f"msg {message.id}", logger)
 
     # For non-photo media, pre-upload the file with parallel workers so that
     # N chunk-upload requests are in-flight concurrently instead of one at a time.
     # Photos are skipped: they go through a different resize/send path.
-    if media_type != "photo" and config.UPLOAD_WORKERS > 1:
+    upload_workers = _effective_upload_workers(
+        config.UPLOAD_WORKERS, sender_pool=sender_pool
+    )
+    if media_type not in ("photo", "video") and upload_workers > 1:
         upload_handle = await _upload_file_parallel(
-            userbot, mf.path, config.UPLOAD_WORKERS,
+            userbot, mf.path, upload_workers,
             sender_pool=sender_pool, on_progress=progress_cb,
         )
+        preuploaded = True
     else:
         upload_handle = mf.path  # let send_file upload sequentially
+        preuploaded = False
 
     if media_type == "photo":
         sent = await userbot.send_file(
@@ -762,21 +864,24 @@ async def _upload_prepared(
     elif media_type == "video":
         if needs_video_conversion(message):
             logger.info(f"Converting non-H.264 video for message {message.id}")
-            mf.path = await convert_video(mf.path)
+            _replace_media_path(mf, await convert_video(mf.path))
             # Re-upload after conversion (path changed, handle is now stale)
             upload_handle = await _upload_file_parallel(
-                userbot, mf.path, config.UPLOAD_WORKERS,
+                userbot, mf.path, upload_workers,
                 sender_pool=sender_pool, on_progress=progress_cb,
             )
+            preuploaded = True
         else:
-            mf.path = await ensure_faststart(mf.path)
-            if config.UPLOAD_WORKERS > 1:
+            _replace_media_path(mf, await ensure_faststart(mf.path))
+            if upload_workers > 1:
                 upload_handle = await _upload_file_parallel(
-                    userbot, mf.path, config.UPLOAD_WORKERS,
+                    userbot, mf.path, upload_workers,
                     sender_pool=sender_pool, on_progress=progress_cb,
                 )
+                preuploaded = True
             else:
                 upload_handle = mf.path
+                preuploaded = False
         video_attr = _get_video_attr(message)
         duration = getattr(video_attr, "duration", 0) or 0
         w = getattr(video_attr, "w", 0) or 0
@@ -788,33 +893,37 @@ async def _upload_prepared(
             attributes=[DocumentAttributeVideo(
                 duration=duration, w=w, h=h, supports_streaming=True
             )],
-            progress_callback=None,  # upload already done
+            progress_callback=None if preuploaded else progress_cb,
         )
 
     elif media_type == "voice":
         sent = await userbot.send_file(
             target_chat, file=upload_handle, caption=caption,
             formatting_entities=message.entities,
-            voice_note=True, progress_callback=None,
+            voice_note=True,
+            progress_callback=None if preuploaded else progress_cb,
         )
 
     elif media_type == "video_note":
         sent = await userbot.send_file(
             target_chat, file=upload_handle, caption=caption,
-            video_note=True, progress_callback=None,
+            video_note=True,
+            progress_callback=None if preuploaded else progress_cb,
         )
 
     elif media_type == "animation":
         sent = await userbot.send_file(
             target_chat, file=upload_handle, caption=caption,
-            formatting_entities=message.entities, progress_callback=None,
+            formatting_entities=message.entities,
+            progress_callback=None if preuploaded else progress_cb,
         )
 
     else:
         sent = await userbot.send_file(
             target_chat, file=upload_handle, caption=caption,
             formatting_entities=message.entities,
-            force_document=True, progress_callback=None,
+            force_document=True,
+            progress_callback=None if preuploaded else progress_cb,
         )
 
     await _expand_telegraph(userbot, message.message, target_chat)
