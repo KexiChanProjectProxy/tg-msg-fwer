@@ -321,7 +321,7 @@ def test_auto_route_single_forward_falls_back_silently_to_direct_download(tmp_pa
         return {"@default": "target-chat", "-100777": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
-        raise RuntimeError("source fetch failed")
+        raise AssertionError("source lookup should not run when bot download succeeds")
 
     async def fake_download(*_args, **_kwargs):
         return tracker
@@ -334,7 +334,6 @@ def test_auto_route_single_forward_falls_back_silently_to_direct_download(tmp_pa
     status = event.replies[0]
     assert status.text == "Done!"
     assert status.edits == [
-        "Fetching original message from source channel...",
         "Downloading media...",
         "Uploading...",
         "Done!",
@@ -383,7 +382,7 @@ def test_auto_route_album_fallback_uploads_grouped_files_with_force_document_fal
         return {"@default": "target-chat", "-100777": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
-        return []
+        raise AssertionError("album source lookup should not run when bot downloads succeed")
 
     async def fake_download(*_args, **_kwargs):
         return trackers[_args[1].id]
@@ -405,7 +404,6 @@ def test_auto_route_album_fallback_uploads_grouped_files_with_force_document_fal
 
     status = bot_client.bot_messages[0][1]
     assert status.edits == [
-        "Fetching original album from source channel...",
         "Downloading 2 media file(s)...",
         "Uploading album...",
         "Done!",
@@ -471,7 +469,7 @@ def test_pending_single_forward_falls_back_to_direct_download_and_clears_pending
         return {"@target": "target-chat", "-100888": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
-        raise RuntimeError("source fetch failed")
+        raise AssertionError("source lookup should not run when bot download succeeds")
 
     async def fake_download(*_args, **_kwargs):
         return tracker
@@ -485,7 +483,6 @@ def test_pending_single_forward_falls_back_to_direct_download_and_clears_pending
     status = event.replies[0]
     assert 77 not in bot_module.pending_forwards
     assert status.edits == [
-        "Fetching original message from source channel...",
         "Downloading media...",
         "Uploading...",
         "Done!",
