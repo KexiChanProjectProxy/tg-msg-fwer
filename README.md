@@ -101,7 +101,7 @@ On first run the userbot will prompt for your phone number and the one-time code
 3. Reply with a channel username or URL (e.g. `@mychannel`).
 4. The bot transfers the media and replies *"Done!"*
 
-If the forwarded message originates from a public/accessible channel, the bot fetches the original via the userbot (benefiting from media-type handling and the file cache). Otherwise it downloads directly from its own copy of the forwarded message.
+Forwarded messages are handled from the bot-owned forwarded copy first. If that BOT download path fails and the forward metadata points back to an accessible source channel, the app falls back to fetching the original through the userbot. Exact message-URL flows such as `/transfer <url> <target>` still use the userbot fetch path directly.
 
 ## LRU file cache
 
