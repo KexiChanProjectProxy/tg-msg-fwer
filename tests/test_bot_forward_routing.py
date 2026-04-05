@@ -30,6 +30,7 @@ def test_auto_route_single_forward_prefers_bot_download_before_any_userbot_looku
     direct_file.write_bytes(b"forward")
     tracker = CleanupTracker(direct_file)
     calls = []
+    source_lookup_calls = []
     uploads = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
@@ -40,9 +41,12 @@ def test_auto_route_single_forward_prefers_bot_download_before_any_userbot_looku
 
     async def fake_resolve_chat(_client, ref):
         calls.append(("resolve_chat", ref))
+        if ref.startswith("-100"):
+            source_lookup_calls.append(("resolve_chat", ref))
         return {"@default": "target-chat", "-100777": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
+        source_lookup_calls.append(("resolve_message", _args[2]))
         raise AssertionError("source lookup should not run when bot download succeeds")
 
     async def fake_download(*_args, **_kwargs):
@@ -72,6 +76,8 @@ def test_auto_route_single_forward_prefers_bot_download_before_any_userbot_looku
         ("download_to_file", 101),
         ("upload_downloaded_message", 101, "target-chat", None),
     ]
+    assert source_lookup_calls == []
+    assert ("resolve_chat", "-100777") not in calls
     assert uploads == [(userbot, fwd_message, direct_file, "target-chat", None)]
     assert tracker.cleaned is True
 
@@ -100,6 +106,7 @@ def test_auto_route_album_prefers_bot_downloads_before_any_userbot_lookup(tmp_pa
     second_file.write_bytes(b"2")
     trackers = {121: CleanupTracker(first_file), 122: CleanupTracker(second_file)}
     calls = []
+    source_lookup_calls = []
     uploads = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
@@ -112,9 +119,12 @@ def test_auto_route_album_prefers_bot_downloads_before_any_userbot_lookup(tmp_pa
 
     async def fake_resolve_chat(_client, ref):
         calls.append(("resolve_chat", ref))
+        if ref.startswith("-100"):
+            source_lookup_calls.append(("resolve_chat", ref))
         return {"@default": "target-chat", "-100777": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
+        source_lookup_calls.append(("resolve_message", _args[2]))
         raise AssertionError("album source lookup should not run when bot downloads succeed")
 
     async def fake_download(*_args, **_kwargs):
@@ -147,6 +157,13 @@ def test_auto_route_album_prefers_bot_downloads_before_any_userbot_lookup(tmp_pa
         ("download_to_file", 122),
         ("upload_downloaded_album", [121, 122], "target-chat", None, False),
     ]
+    first_download_idx = calls.index(("download_to_file", 121))
+    second_download_idx = calls.index(("download_to_file", 122))
+    upload_idx = calls.index(("upload_downloaded_album", [121, 122], "target-chat", None, False))
+    assert first_download_idx < upload_idx
+    assert second_download_idx < upload_idx
+    assert source_lookup_calls == []
+    assert ("resolve_chat", "-100777") not in calls
     assert uploads == [
         (userbot, [first, second], [first_file, second_file], "target-chat", None, False)
     ]
@@ -167,6 +184,8 @@ def test_pending_single_forward_falls_back_to_userbot_only_after_bot_download_fa
     bot_module.pending_forwards[77] = fwd_message
     source_message = make_document_message(make_message, message_id=99, text="source caption")
     calls = []
+    source_lookup_calls = []
+    bot_download_failures = []
     transfers = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
@@ -177,14 +196,18 @@ def test_pending_single_forward_falls_back_to_userbot_only_after_bot_download_fa
 
     async def fake_resolve_chat(_client, ref):
         calls.append(("resolve_chat", ref))
+        if ref.startswith("-100"):
+            source_lookup_calls.append(("resolve_chat", ref))
         return {"@target": "target-chat", "-100888": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
         calls.append(("resolve_message", _args[2]))
+        source_lookup_calls.append(("resolve_message", _args[2]))
         return [source_message]
 
     async def fake_download(*_args, **_kwargs):
         calls.append(("download_to_file", _args[1].id))
+        bot_download_failures.append(_args[1].id)
         raise RuntimeError("bot download failed")
 
     async def fake_transfer_one_message(userbot_client, message, target_chat, source_url=None, **_kwargs):
@@ -214,6 +237,15 @@ def test_pending_single_forward_falls_back_to_userbot_only_after_bot_download_fa
         ("resolve_message", 99),
         ("transfer_one_message", 99, "target-chat", "url:source-chat:99"),
     ]
+    download_idx = calls.index(("download_to_file", 141))
+    source_chat_idx = calls.index(("resolve_chat", "-100888"))
+    source_msg_idx = calls.index(("resolve_message", 99))
+    assert download_idx < source_chat_idx < source_msg_idx
+    assert bot_download_failures == [141]
+    assert source_lookup_calls == [
+        ("resolve_chat", "-100888"),
+        ("resolve_message", 99),
+    ]
     assert transfers == [(userbot, 99, "target-chat", "url:source-chat:99")]
 
 
@@ -238,6 +270,7 @@ def test_auto_route_album_falls_back_as_a_whole_after_bot_download_failure(fake_
     source_first = make_document_message(make_message, message_id=88, text="src-one")
     source_second = make_document_message(make_message, message_id=89, text="src-two")
     calls = []
+    source_lookup_calls = []
     transfers = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
@@ -251,10 +284,13 @@ def test_auto_route_album_falls_back_as_a_whole_after_bot_download_failure(fake_
 
     async def fake_resolve_chat(_client, ref):
         calls.append(("resolve_chat", ref))
+        if ref.startswith("-100"):
+            source_lookup_calls.append(("resolve_chat", ref))
         return {"@default": "target-chat", "-100777": "source-chat"}[ref]
 
     async def fake_resolve_message(*_args, **_kwargs):
         calls.append(("resolve_message", _args[2]))
+        source_lookup_calls.append(("resolve_message", _args[2]))
         return [source_first, source_second]
 
     async def fake_download(*_args, **_kwargs):
@@ -268,10 +304,18 @@ def test_auto_route_album_falls_back_as_a_whole_after_bot_download_failure(fake_
         transfers.append((userbot_client, [msg.id for msg in messages], target_chat, source_url))
         return ["uploaded"]
 
+    async def fake_upload(*_args, **_kwargs):
+        raise AssertionError("BOT-side grouped upload must not run after album download failure")
+
+    async def fake_transfer_one_message(*_args, **_kwargs):
+        raise AssertionError("album fallback must remain whole-album, not per-item")
+
     monkeypatch.setattr(bot_module, "resolve_chat", fake_resolve_chat)
     monkeypatch.setattr(bot_module, "resolve_message", fake_resolve_message)
     monkeypatch.setattr(bot_module, "download_to_file", fake_download)
     monkeypatch.setattr(bot_module, "transfer_album", fake_transfer_album)
+    monkeypatch.setattr(bot_module, "upload_downloaded_album", fake_upload)
+    monkeypatch.setattr(bot_module, "transfer_one_message", fake_transfer_one_message)
 
     run(handle(fake_event(sender_id=11, message=first)))
     run(handle(fake_event(sender_id=11, message=second)))
@@ -291,6 +335,16 @@ def test_auto_route_album_falls_back_as_a_whole_after_bot_download_failure(fake_
         ("resolve_message", 88),
         ("transfer_album", [88, 89], "target-chat", "url:source-chat:88"),
     ]
+    download_idx = calls.index(("download_to_file", 151))
+    source_chat_idx = calls.index(("resolve_chat", "-100777"))
+    source_msg_idx = calls.index(("resolve_message", 88))
+    transfer_album_idx = calls.index(("transfer_album", [88, 89], "target-chat", "url:source-chat:88"))
+    assert download_idx < source_chat_idx < source_msg_idx < transfer_album_idx
+    assert source_lookup_calls == [
+        ("resolve_chat", "-100777"),
+        ("resolve_message", 88),
+    ]
+    assert ("transfer_album", [88, 89], "target-chat", "url:source-chat:88") in calls
     assert transfers == [(userbot, [88, 89], "target-chat", "url:source-chat:88")]
 
 
@@ -399,21 +453,88 @@ def test_cmd_transfer_parse_failure_does_not_enter_forwarded_bot_download_path(f
     userbot = fake_client.__class__()
     event = fake_event(sender_id=18, message=make_message(id=502, text="/transfer", message="/transfer"))
     event.pattern_match = SimpleNamespace(group=lambda _index: "not-a-url @target")
+    calls = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
     handle = handler(bot_client, "cmd_transfer")
 
     monkeypatch.setattr(bot_module, "is_admin", lambda _sender_id: True)
 
+    async def fake_resolve_chat(*_args, **_kwargs):
+        calls.append(("resolve_chat", _args[1]))
+        raise AssertionError("malformed transfer URLs should fail before resolve_chat")
+
+    async def fake_resolve_message(*_args, **_kwargs):
+        calls.append(("resolve_message", _args[2]))
+        raise AssertionError("malformed transfer URLs should fail before resolve_message")
+
+    async def fake_transfer_one_message(*_args, **_kwargs):
+        calls.append(("transfer_one_message", _args[1].id))
+        raise AssertionError("malformed transfer URLs should fail before transfer")
+
     async def fake_download(*_args, **_kwargs):
         raise AssertionError("malformed transfer URLs should not reach bot download helpers")
 
+    monkeypatch.setattr(bot_module, "resolve_chat", fake_resolve_chat)
+    monkeypatch.setattr(bot_module, "resolve_message", fake_resolve_message)
+    monkeypatch.setattr(bot_module, "transfer_one_message", fake_transfer_one_message)
     monkeypatch.setattr(bot_module, "download_to_file", fake_download)
 
     run(handle(event))
 
     status = event.replies[0]
     assert status.edits == ["Could not parse message URL."]
+    assert calls == []
+
+
+def test_private_message_link_access_failure_stays_out_of_forwarded_bot_download_path(fake_client, fake_event, make_message, monkeypatch):
+    bot_client = fake_client
+    userbot = fake_client.__class__()
+    event = fake_event(
+        sender_id=192,
+        text="check https://t.me/privatechan/77",
+        message=make_message(id=505, text="check https://t.me/privatechan/77", message="check https://t.me/privatechan/77"),
+    )
+    calls = []
+
+    bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
+    handle = handler(bot_client, "handle_forwarded_or_target")
+
+    monkeypatch.setattr(bot_module, "is_admin", lambda _sender_id: True)
+    monkeypatch.setattr(bot_module, "find_message_urls", lambda _text: [("privatechan", 77)])
+    monkeypatch.setattr(bot_module.config, "DEFAULT_CHANNEL", "@default")
+
+    async def fake_resolve_chat(_client, ref):
+        calls.append(("resolve_chat", ref))
+        if ref == "privatechan":
+            raise RuntimeError("no access")
+        raise AssertionError("target channel resolution should not run after source access failure")
+
+    async def fake_resolve_message(*_args, **_kwargs):
+        calls.append(("resolve_message", _args[2]))
+        raise AssertionError("inaccessible source links should not reach resolve_message")
+
+    async def fake_transfer_one_message(*_args, **_kwargs):
+        calls.append(("transfer_one_message", _args[1].id))
+        raise AssertionError("inaccessible source links should not reach transfer_one_message")
+
+    async def fake_download(*_args, **_kwargs):
+        raise AssertionError("inaccessible source links should not enter forwarded bot-download helpers")
+
+    monkeypatch.setattr(bot_module, "resolve_chat", fake_resolve_chat)
+    monkeypatch.setattr(bot_module, "resolve_message", fake_resolve_message)
+    monkeypatch.setattr(bot_module, "transfer_one_message", fake_transfer_one_message)
+    monkeypatch.setattr(bot_module, "download_to_file", fake_download)
+
+    run(handle(event))
+
+    status = event.replies[0]
+    assert status.edits == [
+        "Cannot access channel 'privatechan'. The userbot may need to join it first."
+    ]
+    assert calls == [
+        ("resolve_chat", "privatechan"),
+    ]
 
 
 def test_private_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_download(fake_client, fake_event, make_message, monkeypatch):

@@ -400,8 +400,9 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
         """
         Transfer *fwd_message* to the channel identified by *target_ref*.
 
-        Prefers direct BOT download first; falls back to the original channel source
-        only if the BOT download path fails.
+        Uses the bot-owned forwarded copy first. Falls back to fetching the
+        original source through the userbot only if BOT download fails and the
+        forward metadata points to an accessible source message.
         Returns True on success.
         """
         try:
@@ -410,36 +411,15 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             await status_msg.edit(f"Could not resolve default channel {target_ref!r}: {e}")
             return False
 
-        fwd_from = fwd_message.fwd_from
-        channel_id = getattr(fwd_from, "channel_id", None)
-        channel_post = getattr(fwd_from, "channel_post", None)
-
         await status_msg.edit("Downloading media...")
-        bot_error = None
         try:
             mf = await download_to_file(bot, fwd_message, cache=file_cache)
             if mf is None:
                 raise RuntimeError("Failed to download forwarded media")
-        except Exception as exc:
-            bot_error = exc
-
-        if bot_error is None:
-            try:
-                await status_msg.edit("Uploading...")
-                await upload_downloaded_message(
-                    userbot,
-                    fwd_message,
-                    mf,
-                    target_chat,
-                    media_type=get_media_type(fwd_message),
-                )
-            finally:
-                mf.cleanup()
-
-            await status_msg.edit("Done!")
-            return True
-
-        if bot_error is not None:
+        except Exception as bot_error:
+            fwd_from = fwd_message.fwd_from
+            channel_id = getattr(fwd_from, "channel_id", None)
+            channel_post = getattr(fwd_from, "channel_post", None)
             if channel_id and channel_post:
                 await status_msg.edit("Fetching original message from source channel...")
                 source_ref = f"-100{channel_id}"
@@ -460,12 +440,28 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                     return True
             raise bot_error
 
+        try:
+            await status_msg.edit("Uploading...")
+            await upload_downloaded_message(
+                userbot,
+                fwd_message,
+                mf,
+                target_chat,
+                media_type=get_media_type(fwd_message),
+            )
+        finally:
+            mf.cleanup()
+
+        await status_msg.edit("Done!")
+        return True
+
     async def _transfer_album_to_default(album_messages: List[Message], target_ref: str, status_msg) -> bool:
         """
         Transfer an album (list of grouped messages) to the channel identified by target_ref.
-        Prefers downloading all members from the bot and sending them as a grouped
-        album; falls back to the original channel source (once for the whole album)
-        only if the BOT download path fails.
+        Uses the bot-owned forwarded album first by downloading every member via
+        the bot and uploading them as one grouped album. Falls back to fetching
+        the original source album through the userbot only if that BOT download
+        path fails and the forward metadata points to an accessible source post.
         Returns True on success.
         """
         try:
@@ -511,10 +507,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                 if messages:
                     source_url = build_message_url(source_chat, channel_post)
                     await status_msg.edit("Transferring album...")
-                    if len(messages) == 1:
-                        await transfer_one_message(userbot, messages[0], target_chat, source_url, cache=file_cache)
-                    else:
-                        await transfer_album(userbot, messages, target_chat, source_url, cache=file_cache)
+                    await transfer_album(userbot, messages, target_chat, source_url, cache=file_cache)
                     await status_msg.edit("Done!")
                     return True
             raise bot_error
