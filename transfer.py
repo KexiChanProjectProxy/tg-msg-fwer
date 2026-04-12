@@ -218,6 +218,8 @@ async def transfer_one_message(
     target_chat,
     source_url: str,
     cache=None,
+    *,
+    force_message_download: bool = False,
 ) -> Optional[Message]:
     """Download and re-upload a single non-album message with correct media type."""
     if message.action:
@@ -247,7 +249,12 @@ async def transfer_one_message(
         return None
 
     media_type = get_media_type(message)
-    mf = await _download_to_file(userbot, message, cache)
+    mf = await _download_to_file(
+        userbot,
+        message,
+        cache,
+        force_message_download=force_message_download,
+    )
     if mf is None:
         return None
 
@@ -273,6 +280,8 @@ async def transfer_album(
     target_chat,
     source_url: str,
     cache=None,
+    *,
+    force_message_download: bool = False,
 ) -> Optional[List[Message]]:
     """Download all album media concurrently and re-upload as a grouped album."""
     if not messages:
@@ -281,7 +290,15 @@ async def transfer_album(
     # Concurrent downloads to disk
     media_messages = [msg for msg in messages if msg.media is not None]
     results = await asyncio.gather(
-        *[_download_to_file(userbot, msg, cache) for msg in media_messages],
+        *[
+            _download_to_file(
+                userbot,
+                msg,
+                cache,
+                force_message_download=force_message_download,
+            )
+            for msg in media_messages
+        ],
         return_exceptions=True,
     )
 
@@ -1120,6 +1137,7 @@ async def _download_to_file(
     on_progress=None,
     *,
     raise_on_error: bool = False,
+    force_message_download: bool = False,
 ) -> Optional[_MediaFile]:
     """
     Download message media to a temp file in config.TEMP_DIR (real disk, not tmpfs).
@@ -1154,7 +1172,12 @@ async def _download_to_file(
         dl_timeout = max(config.OPERATION_TIMEOUT, file_size // 524_288 + 120)
 
         media = message.media
-        if hasattr(media, "document") and media.document and file_size > 0:
+        if (
+            hasattr(media, "document")
+            and media.document
+            and file_size > 0
+            and not force_message_download
+        ):
             phase = "downloading document media"
             # Parallel segment download for documents (videos, large files).
             # iter_download opens a separate connection per generator, so N workers
@@ -1172,7 +1195,6 @@ async def _download_to_file(
                 timeout=dl_timeout,
             )
         else:
-            # Photos and other media types — fall back to download_media
             phase = "downloading media"
             result = await asyncio.wait_for(
                 userbot.download_media(message, file=str(tmp), progress_callback=on_progress),

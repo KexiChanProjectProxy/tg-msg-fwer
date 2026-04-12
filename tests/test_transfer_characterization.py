@@ -316,6 +316,37 @@ def test_download_to_file_uses_actual_download_media_return_path(tmp_path, monke
     assert media_file.path.exists() is False
 
 
+def test_download_to_file_forced_message_download_uses_download_media_for_documents(tmp_path, monkeypatch, make_message):
+    temp_dir = tmp_path / "temp"
+    actual_path = temp_dir / "telegram-document.bin"
+    message = make_document_message(make_message, message_id=589, filename="report.bin")
+    calls = []
+
+    class Client:
+        async def download_media(self, _message, *, file, progress_callback=None):
+            calls.append(("download_media", Path(file), progress_callback))
+            Path(file).parent.mkdir(parents=True, exist_ok=True)
+            actual_path.write_bytes(b"doc-bytes")
+            return str(actual_path)
+
+    monkeypatch.setattr(transfer.config, "TEMP_DIR", temp_dir)
+
+    media_file = run(
+        transfer._download_to_file(
+            Client(),
+            message,
+            force_message_download=True,
+        )
+    )
+
+    assert media_file is not None
+    assert media_file.path == actual_path
+    assert media_file.path.read_bytes() == b"doc-bytes"
+    assert len(calls) == 1
+    media_file.cleanup()
+    assert media_file.path.exists() is False
+
+
 def test_public_download_to_file_raises_readable_error_and_cleans_partial_file(tmp_path, monkeypatch, make_message):
     temp_dir = tmp_path / "temp"
     message = make_message(id=588, text="photo", message="photo", media=SimpleNamespace(photo=SimpleNamespace(id=5880)), has_media=True)
