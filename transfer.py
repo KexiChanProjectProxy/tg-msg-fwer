@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from typing import List, Optional, Set, Tuple
 
 from telethon import TelegramClient, utils as tl_utils
+from telethon.errors import FloodWaitError
 from telethon.tl import functions as tl_functions
 from telethon.tl.types import (
     Message,
@@ -1084,6 +1085,27 @@ def _get_doc_ext(message: Message) -> str:
     return ""
 
 
+async def _fetch_media_from_resolved_message(
+    userbot: TelegramClient,
+    message: Message,
+    *,
+    file,
+    on_progress=None,
+):
+    download = getattr(message, "download_media", None)
+
+    async def _run_download():
+        if callable(download):
+            return await download(file=file, progress_callback=on_progress)
+        return await userbot.download_media(message, file=file, progress_callback=on_progress)
+
+    try:
+        return await _run_download()
+    except FloodWaitError as flood_wait:
+        await asyncio.sleep(flood_wait.seconds)
+        return await _run_download()
+
+
 async def _parallel_download(userbot, input_location, output_path: Path,
                               file_size: int, dc_id: int,
                               n_workers: int, on_progress=None) -> None:
@@ -1197,7 +1219,12 @@ async def _download_to_file(
         else:
             phase = "downloading media"
             result = await asyncio.wait_for(
-                userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
+                _fetch_media_from_resolved_message(
+                    userbot,
+                    message,
+                    file=str(tmp),
+                    on_progress=on_progress,
+                ),
                 timeout=dl_timeout,
             )
             if isinstance(result, (str, Path)):

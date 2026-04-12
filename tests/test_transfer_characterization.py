@@ -316,7 +316,7 @@ def test_download_to_file_uses_actual_download_media_return_path(tmp_path, monke
     assert media_file.path.exists() is False
 
 
-def test_download_to_file_forced_message_download_uses_download_media_for_documents(tmp_path, monkeypatch, make_message):
+def test_download_to_file_forced_message_download_uses_resolved_message_fetch(tmp_path, monkeypatch, make_message):
     temp_dir = tmp_path / "temp"
     actual_path = temp_dir / "telegram-document.bin"
     message = make_document_message(make_message, message_id=589, filename="report.bin")
@@ -324,10 +324,15 @@ def test_download_to_file_forced_message_download_uses_download_media_for_docume
 
     class Client:
         async def download_media(self, _message, *, file, progress_callback=None):
-            calls.append(("download_media", Path(file), progress_callback))
-            Path(file).parent.mkdir(parents=True, exist_ok=True)
-            actual_path.write_bytes(b"doc-bytes")
-            return str(actual_path)
+            raise AssertionError("forced message fetch should use the resolved message helper")
+
+    async def fake_message_download_media(*, file, progress_callback=None):
+        calls.append(("message.download_media", Path(file), progress_callback))
+        Path(file).parent.mkdir(parents=True, exist_ok=True)
+        actual_path.write_bytes(b"doc-bytes")
+        return str(actual_path)
+
+    message.download_media = fake_message_download_media
 
     monkeypatch.setattr(transfer.config, "TEMP_DIR", temp_dir)
 
