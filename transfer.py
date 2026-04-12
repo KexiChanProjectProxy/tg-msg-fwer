@@ -39,6 +39,55 @@ logger = logging.getLogger(__name__)
 _MAX_FILE_SIZE = 4 * 1024 ** 3 if config.IS_PREMIUM else 2 * 1024 ** 3
 
 
+def _path_context(path: Optional[Path]) -> str:
+    if path is None:
+        return "<unknown>"
+    if path.is_absolute():
+        return str(path)
+    return f"{path} (cwd={Path.cwd()})"
+
+
+class MediaDownloadError(RuntimeError):
+    def __init__(
+        self,
+        *,
+        message_id: int,
+        phase: str,
+        temp_path: Optional[Path] = None,
+        downloaded_path: Optional[Path] = None,
+        cause: Optional[BaseException] = None,
+    ):
+        self.message_id = message_id
+        self.phase = phase
+        self.temp_path = temp_path
+        self.downloaded_path = downloaded_path
+        self.cause = cause
+
+        path = downloaded_path or temp_path
+        message = (
+            f"Media download failed for message {message_id} during {phase}"
+            f" at {_path_context(path)}"
+        )
+        if cause is not None:
+            message += f": {type(cause).__name__}: {cause}"
+        super().__init__(message)
+
+
+def _cleanup_partial_downloads(*paths: Optional[Path]) -> None:
+    seen = set()
+    for path in paths:
+        if path is None:
+            continue
+        key = str(path)
+        if key in seen:
+            continue
+        seen.add(key)
+        try:
+            path.unlink(missing_ok=True)
+        except Exception as cleanup_error:
+            logger.warning("Failed to clean up partial download %s: %s", path, cleanup_error)
+
+
 def _sender_pool_capacity(sender_pool) -> Optional[int]:
     if sender_pool is None:
         return None
@@ -1065,7 +1114,12 @@ async def _parallel_download(userbot, input_location, output_path: Path,
 
 
 async def _download_to_file(
-    userbot: TelegramClient, message: Message, cache=None, on_progress=None
+    userbot: TelegramClient,
+    message: Message,
+    cache=None,
+    on_progress=None,
+    *,
+    raise_on_error: bool = False,
 ) -> Optional[_MediaFile]:
     """
     Download message media to a temp file in config.TEMP_DIR (real disk, not tmpfs).
@@ -1076,28 +1130,32 @@ async def _download_to_file(
     """
     config.TEMP_DIR.mkdir(parents=True, exist_ok=True)
     file_id = _get_file_unique_id(message)
-
-    # --- Cache hit: hardlink into TEMP_DIR with correct extension ---
-    if cache and file_id:
-        cached_path = cache.get(file_id)
-        if cached_path:
-            ext = _get_doc_ext(message) or guess_extension_from_file(cached_path)
-            link = config.TEMP_DIR / f"dl_{uuid.uuid4().hex}.{ext}"
-            try:
-                os.link(cached_path, link)
-            except OSError:
-                shutil.copy2(cached_path, link)
-            return _MediaFile(link, owned=True)
-
-    # --- Fresh download to TEMP_DIR ---
     tmp = config.TEMP_DIR / f"dl_{message.id}_{uuid.uuid4().hex}.bin"
+    downloaded_path = tmp
+    phase = "preparing temp directory"
+
     try:
+        # --- Cache hit: hardlink into TEMP_DIR with correct extension ---
+        if cache and file_id:
+            cached_path = cache.get(file_id)
+            if cached_path:
+                phase = "staging cached media"
+                ext = _get_doc_ext(message) or guess_extension_from_file(cached_path)
+                link = config.TEMP_DIR / f"dl_{uuid.uuid4().hex}.{ext}"
+                downloaded_path = link
+                try:
+                    os.link(cached_path, link)
+                except OSError:
+                    shutil.copy2(cached_path, link)
+                return _MediaFile(link, owned=True)
+
         file_size = _get_file_size(message) or 0
         # Floor at OPERATION_TIMEOUT; add extra time assuming ≥512 KB/s minimum throughput
         dl_timeout = max(config.OPERATION_TIMEOUT, file_size // 524_288 + 120)
 
         media = message.media
         if hasattr(media, "document") and media.document and file_size > 0:
+            phase = "downloading document media"
             # Parallel segment download for documents (videos, large files).
             # iter_download opens a separate connection per generator, so N workers
             # = N concurrent TCP streams = N× throughput over a single connection.
@@ -1115,17 +1173,31 @@ async def _download_to_file(
             )
         else:
             # Photos and other media types — fall back to download_media
-            await asyncio.wait_for(
+            phase = "downloading media"
+            result = await asyncio.wait_for(
                 userbot.download_media(message, file=str(tmp), progress_callback=on_progress),
                 timeout=dl_timeout,
             )
+            if isinstance(result, (str, Path)):
+                downloaded_path = Path(result)
 
+        phase = "verifying downloaded file"
+        if not downloaded_path.exists() and tmp.exists():
+            downloaded_path = tmp
+        if not downloaded_path.exists():
+            raise FileNotFoundError(downloaded_path)
+
+        phase = "probing file extension"
         ext = _get_doc_ext(message)
         if not ext:
-            ext = await probe_extension_file(tmp)
+            ext = await probe_extension_file(downloaded_path)
 
-        final = tmp.with_name(f"{tmp.stem}.{ext}")
-        tmp.rename(final)
+        phase = "finalizing downloaded file name"
+        final = downloaded_path.with_name(f"{downloaded_path.stem}.{ext}")
+        if final != downloaded_path:
+            downloaded_path.rename(final)
+        else:
+            final = downloaded_path
 
         if cache and file_id:
             await cache.put_file(file_id, final)
@@ -1133,12 +1205,27 @@ async def _download_to_file(
         return _MediaFile(final, owned=True)
 
     except Exception as e:
-        logger.error(f"Failed to download media for message {message.id}: {e}")
-        tmp.unlink(missing_ok=True)
+        error = MediaDownloadError(
+            message_id=message.id,
+            phase=phase,
+            temp_path=tmp,
+            downloaded_path=downloaded_path,
+            cause=e,
+        )
+        logger.error("%s", error)
+        _cleanup_partial_downloads(downloaded_path, tmp)
+        if raise_on_error:
+            raise error from e
         return None
 
 
 async def download_to_file(
     client: TelegramClient, message: Message, cache=None, on_progress=None
 ) -> Optional[_MediaFile]:
-    return await _download_to_file(client, message, cache=cache, on_progress=on_progress)
+    return await _download_to_file(
+        client,
+        message,
+        cache=cache,
+        on_progress=on_progress,
+        raise_on_error=True,
+    )

@@ -265,6 +265,84 @@ def test_download_to_file_cache_hit_copies_into_temp_dir_with_message_extension(
     assert cached_path.exists() is True
 
 
+def test_download_to_file_keeps_bin_path_without_self_rename(tmp_path, monkeypatch, make_message):
+    temp_dir = tmp_path / "temp"
+    message = make_message(id=586, text="photo", message="photo", media=SimpleNamespace(photo=SimpleNamespace(id=5860)), has_media=True)
+    observed = {}
+
+    class Client:
+        async def download_media(self, _message, *, file, progress_callback=None):
+            path = Path(file)
+            path.write_bytes(b"downloaded")
+            observed["path"] = path
+            observed["progress_callback"] = progress_callback
+            return str(path)
+
+    monkeypatch.setattr(transfer.config, "TEMP_DIR", temp_dir)
+    monkeypatch.setattr(transfer, "_get_doc_ext", lambda _message: "")
+    monkeypatch.setattr(transfer, "probe_extension_file", lambda _path: asyncio.sleep(0, result="bin"))
+
+    media_file = run(transfer._download_to_file(Client(), message))
+
+    assert media_file is not None
+    assert media_file.path == observed["path"]
+    assert media_file.path.suffix == ".bin"
+    assert media_file.path.read_bytes() == b"downloaded"
+    media_file.cleanup()
+    assert media_file.path.exists() is False
+
+
+def test_download_to_file_uses_actual_download_media_return_path(tmp_path, monkeypatch, make_message):
+    temp_dir = tmp_path / "temp"
+    actual_path = temp_dir / "telegram-photo.jpg"
+    message = make_message(id=587, text="photo", message="photo", media=SimpleNamespace(photo=SimpleNamespace(id=5870)), has_media=True)
+
+    class Client:
+        async def download_media(self, _message, *, file, progress_callback=None):
+            Path(file).parent.mkdir(parents=True, exist_ok=True)
+            actual_path.write_bytes(b"jpeg-bytes")
+            return str(actual_path)
+
+    monkeypatch.setattr(transfer.config, "TEMP_DIR", temp_dir)
+    monkeypatch.setattr(transfer, "_get_doc_ext", lambda _message: "")
+    monkeypatch.setattr(transfer, "probe_extension_file", lambda _path: asyncio.sleep(0, result="jpg"))
+
+    media_file = run(transfer._download_to_file(Client(), message))
+
+    assert media_file is not None
+    assert media_file.path == actual_path
+    assert media_file.path.read_bytes() == b"jpeg-bytes"
+    media_file.cleanup()
+    assert media_file.path.exists() is False
+
+
+def test_public_download_to_file_raises_readable_error_and_cleans_partial_file(tmp_path, monkeypatch, make_message):
+    temp_dir = tmp_path / "temp"
+    message = make_message(id=588, text="photo", message="photo", media=SimpleNamespace(photo=SimpleNamespace(id=5880)), has_media=True)
+    observed = {}
+
+    class Client:
+        async def download_media(self, _message, *, file, progress_callback=None):
+            path = Path(file)
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"partial")
+            observed["path"] = path
+            return str(path.parent / "missing.bin")
+
+    monkeypatch.setattr(transfer.config, "TEMP_DIR", temp_dir)
+
+    try:
+        run(transfer.download_to_file(Client(), message))
+        raise AssertionError("download_to_file should have raised MediaDownloadError")
+    except transfer.MediaDownloadError as exc:
+        assert exc.message_id == 588
+        assert exc.phase == "verifying downloaded file"
+        assert "Media download failed for message 588" in str(exc)
+        assert "missing.bin" in str(exc)
+
+    assert observed["path"].exists() is False
+
+
 def test_file_cache_put_file_falls_back_to_copy_and_get_touches_atime(tmp_path, monkeypatch):
     source = tmp_path / "source.bin"
     source.write_bytes(b"cache me")
