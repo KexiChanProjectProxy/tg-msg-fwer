@@ -3,6 +3,7 @@ import logging
 import re
 import shutil
 from typing import Dict, List, Optional, Tuple, Union
+from urllib.parse import parse_qs, urlsplit
 
 from telethon import TelegramClient, events
 from telethon.tl.custom import Button
@@ -856,7 +857,26 @@ _TME_RE = re.compile(
     r'(?:https?://)?(?:www\.)?t\.me/'
     r'(?:c/(\d+)|([a-zA-Z_]\w{3,}))'
     r'/(\d+)'
+    r'(\?[^\s]*)?'
 )
+
+
+def _message_url_target_msg_id(url: str, default_msg_id: int) -> int:
+    query = urlsplit(url).query
+    if not query and "?" in url:
+        query = url.split("?", 1)[1]
+
+    values = parse_qs(query)
+    for key in ("comment",):
+        candidates = values.get(key)
+        if not candidates:
+            continue
+        try:
+            return int(candidates[-1])
+        except (TypeError, ValueError):
+            continue
+
+    return default_msg_id
 
 
 def _parse_message_url(url: str):
@@ -870,7 +890,7 @@ def _parse_message_url(url: str):
         return None, None
     channel_id, username, msg_id_str = m.group(1), m.group(2), m.group(3)
     try:
-        msg_id = int(msg_id_str)
+        msg_id = _message_url_target_msg_id(url, int(msg_id_str))
     except (TypeError, ValueError):
         return None, None
     if channel_id:
@@ -887,7 +907,7 @@ def find_message_urls(text: str) -> List[Tuple[str, int]]:
     for m in _TME_RE.finditer(text):
         channel_id, username, msg_id_str = m.group(1), m.group(2), m.group(3)
         try:
-            msg_id = int(msg_id_str)
+            msg_id = _message_url_target_msg_id(m.group(0), int(msg_id_str))
         except (TypeError, ValueError):
             continue
         if channel_id:

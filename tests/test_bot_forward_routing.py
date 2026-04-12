@@ -455,6 +455,46 @@ def test_cmd_transfer_keeps_userbot_fetch_for_explicit_message_url(fake_client, 
     assert transfer_kwargs == [{"force_message_download": True}]
 
 
+def test_cmd_transfer_uses_comment_message_id_from_explicit_message_url(fake_client, fake_event, make_message, monkeypatch):
+    bot_client = fake_client
+    userbot = fake_client.__class__()
+    event = fake_event(sender_id=1717, message=make_message(id=511, text="/transfer", message="/transfer"))
+    event.pattern_match = SimpleNamespace(group=lambda _index: "https://t.me/btcl6/2784?single&comment=2796 @target")
+    source_message = make_document_message(make_message, message_id=2796, text="comment")
+    calls = []
+
+    bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
+    handle = handler(bot_client, "cmd_transfer")
+
+    monkeypatch.setattr(bot_module, "is_admin", lambda _sender_id: True)
+    monkeypatch.setattr(bot_module, "build_message_url", lambda chat, msg_id: f"url:{chat}:{msg_id}")
+
+    async def fake_resolve_chat(_client, ref):
+        calls.append(("resolve_chat", ref))
+        return {"btcl6": "source-chat", "@target": "target-chat"}[ref]
+
+    async def fake_resolve_message(_client, chat, msg_id):
+        calls.append(("resolve_message", chat, msg_id))
+        return [source_message]
+
+    async def fake_transfer_one_message(_client, message, target_chat, source_url=None, **_kwargs):
+        calls.append(("transfer_one_message", message.id, target_chat, source_url))
+        return "uploaded"
+
+    monkeypatch.setattr(bot_module, "resolve_chat", fake_resolve_chat)
+    monkeypatch.setattr(bot_module, "resolve_message", fake_resolve_message)
+    monkeypatch.setattr(bot_module, "transfer_one_message", fake_transfer_one_message)
+
+    run(handle(event))
+
+    assert calls == [
+        ("resolve_chat", "btcl6"),
+        ("resolve_chat", "@target"),
+        ("resolve_message", "source-chat", 2796),
+        ("transfer_one_message", 2796, "target-chat", "url:source-chat:2796"),
+    ]
+
+
 def test_cmd_transfer_keeps_userbot_fetch_for_private_message_url(fake_client, fake_event, make_message, monkeypatch):
     bot_client = fake_client
     userbot = fake_client.__class__()
@@ -652,6 +692,50 @@ def test_private_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_d
         ("transfer_one_message", 77, "target-chat", "url:source-chat:77"),
     ]
     assert transfer_kwargs == [{"cache": "cache-sentinel", "force_message_download": True}]
+
+
+def test_private_message_link_flow_uses_comment_message_id(fake_client, fake_event, make_message, monkeypatch):
+    bot_client = fake_client
+    userbot = fake_client.__class__()
+    event = fake_event(
+        sender_id=119,
+        text="check https://t.me/btcl6/2784?single&comment=2796",
+        message=make_message(id=506, text="check https://t.me/btcl6/2784?single&comment=2796", message="check https://t.me/btcl6/2784?single&comment=2796"),
+    )
+    source_message = make_document_message(make_message, message_id=2796, text="linked-comment")
+    calls = []
+
+    bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
+    handle = handler(bot_client, "handle_forwarded_or_target")
+
+    monkeypatch.setattr(bot_module, "is_admin", lambda _sender_id: True)
+    monkeypatch.setattr(bot_module, "build_message_url", lambda chat, msg_id: f"url:{chat}:{msg_id}")
+    monkeypatch.setattr(bot_module.config, "DEFAULT_CHANNEL", "@default")
+
+    async def fake_resolve_chat(_client, ref):
+        calls.append(("resolve_chat", ref))
+        return {"btcl6": "source-chat", "@default": "target-chat"}[ref]
+
+    async def fake_resolve_message(_client, chat, msg_id):
+        calls.append(("resolve_message", chat, msg_id))
+        return [source_message]
+
+    async def fake_transfer_one_message(_client, message, target_chat, source_url=None, **_kwargs):
+        calls.append(("transfer_one_message", message.id, target_chat, source_url))
+        return "uploaded"
+
+    monkeypatch.setattr(bot_module, "resolve_chat", fake_resolve_chat)
+    monkeypatch.setattr(bot_module, "resolve_message", fake_resolve_message)
+    monkeypatch.setattr(bot_module, "transfer_one_message", fake_transfer_one_message)
+
+    run(handle(event))
+
+    assert calls == [
+        ("resolve_chat", "btcl6"),
+        ("resolve_message", "source-chat", 2796),
+        ("resolve_chat", "@default"),
+        ("transfer_one_message", 2796, "target-chat", "url:source-chat:2796"),
+    ]
 
 
 def test_private_c_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_download(fake_client, fake_event, make_message, monkeypatch):
