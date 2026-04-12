@@ -172,13 +172,25 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             await status_msg.edit("Transferring...")
 
             if len(messages) == 1:
-                sent = await transfer_one_message(userbot, messages[0], target_chat, url)
+                sent = await transfer_one_message(
+                    userbot,
+                    messages[0],
+                    target_chat,
+                    url,
+                    force_message_download=True,
+                )
                 if sent:
                     await status_msg.edit(f"Done! Transferred message {msg_id}.")
                 else:
                     await status_msg.edit("Skipped (unsupported message type).")
             else:
-                sent = await transfer_album(userbot, messages, target_chat, url)
+                sent = await transfer_album(
+                    userbot,
+                    messages,
+                    target_chat,
+                    url,
+                    force_message_download=True,
+                )
                 if sent:
                     await status_msg.edit(
                         f"Done! Transferred album ({len(messages)} media files)."
@@ -785,11 +797,21 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
                         await status_msg.edit("Transferring…")
                         if len(messages) == 1:
                             await transfer_one_message(
-                                userbot, messages[0], target_chat, url, cache=file_cache
+                                userbot,
+                                messages[0],
+                                target_chat,
+                                url,
+                                cache=file_cache,
+                                force_message_download=True,
                             )
                         else:
                             await transfer_album(
-                                userbot, messages, target_chat, url, cache=file_cache
+                                userbot,
+                                messages,
+                                target_chat,
+                                url,
+                                cache=file_cache,
+                                force_message_download=True,
                             )
                         await status_msg.edit("Done!")
                     except Exception as e:

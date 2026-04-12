@@ -409,6 +409,7 @@ def test_cmd_transfer_keeps_userbot_fetch_for_explicit_message_url(fake_client, 
     event.pattern_match = SimpleNamespace(group=lambda _index: "https://t.me/sourcechan/55 @target")
     source_message = make_document_message(make_message, message_id=55, text="hello")
     calls = []
+    transfer_kwargs = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
     handle = handler(bot_client, "cmd_transfer")
@@ -426,6 +427,7 @@ def test_cmd_transfer_keeps_userbot_fetch_for_explicit_message_url(fake_client, 
 
     async def fake_transfer_one_message(_client, message, target_chat, source_url=None, **_kwargs):
         calls.append(("transfer_one_message", message.id, target_chat, source_url))
+        transfer_kwargs.append(_kwargs)
         return "uploaded"
 
     async def fake_download(*_args, **_kwargs):
@@ -450,6 +452,7 @@ def test_cmd_transfer_keeps_userbot_fetch_for_explicit_message_url(fake_client, 
         ("resolve_message", "source-chat", 55),
         ("transfer_one_message", 55, "target-chat", "url:source-chat:55"),
     ]
+    assert transfer_kwargs == [{"force_message_download": True}]
 
 
 def test_cmd_transfer_keeps_userbot_fetch_for_private_message_url(fake_client, fake_event, make_message, monkeypatch):
@@ -459,6 +462,7 @@ def test_cmd_transfer_keeps_userbot_fetch_for_private_message_url(fake_client, f
     event.pattern_match = SimpleNamespace(group=lambda _index: "https://t.me/c/1234567890/55 @target")
     source_message = make_document_message(make_message, message_id=55, text="hello")
     calls = []
+    transfer_kwargs = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
     handle = handler(bot_client, "cmd_transfer")
@@ -476,6 +480,7 @@ def test_cmd_transfer_keeps_userbot_fetch_for_private_message_url(fake_client, f
 
     async def fake_transfer_one_message(_client, message, target_chat, source_url=None, **_kwargs):
         calls.append(("transfer_one_message", message.id, target_chat, source_url))
+        transfer_kwargs.append(_kwargs)
         return "uploaded"
 
     async def fake_download(*_args, **_kwargs):
@@ -500,6 +505,7 @@ def test_cmd_transfer_keeps_userbot_fetch_for_private_message_url(fake_client, f
         ("resolve_message", "private-source-chat", 55),
         ("transfer_one_message", 55, "target-chat", "url:private-source-chat:55"),
     ]
+    assert transfer_kwargs == [{"force_message_download": True}]
 
 
 def test_cmd_transfer_parse_failure_does_not_enter_forwarded_bot_download_path(fake_client, fake_event, make_message, monkeypatch):
@@ -601,6 +607,7 @@ def test_private_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_d
     )
     source_message = make_document_message(make_message, message_id=77, text="linked")
     calls = []
+    transfer_kwargs = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
     handle = handler(bot_client, "handle_forwarded_or_target")
@@ -620,6 +627,7 @@ def test_private_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_d
 
     async def fake_transfer_one_message(_client, message, target_chat, source_url=None, **_kwargs):
         calls.append(("transfer_one_message", message.id, target_chat, source_url))
+        transfer_kwargs.append(_kwargs)
         return "uploaded"
 
     async def fake_download(*_args, **_kwargs):
@@ -643,6 +651,7 @@ def test_private_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_d
         ("resolve_chat", "@default"),
         ("transfer_one_message", 77, "target-chat", "url:source-chat:77"),
     ]
+    assert transfer_kwargs == [{"cache": "cache-sentinel", "force_message_download": True}]
 
 
 def test_private_c_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot_download(fake_client, fake_event, make_message, monkeypatch):
@@ -655,6 +664,7 @@ def test_private_c_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot
     )
     source_message = make_document_message(make_message, message_id=77, text="linked-private")
     calls = []
+    transfer_kwargs = []
 
     bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
     handle = handler(bot_client, "handle_forwarded_or_target")
@@ -674,6 +684,7 @@ def test_private_c_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot
 
     async def fake_transfer_one_message(_client, message, target_chat, source_url=None, **_kwargs):
         calls.append(("transfer_one_message", message.id, target_chat, source_url))
+        transfer_kwargs.append(_kwargs)
         return "uploaded"
 
     async def fake_download(*_args, **_kwargs):
@@ -697,6 +708,7 @@ def test_private_c_message_link_flow_keeps_userbot_fetch_and_skips_forwarded_bot
         ("resolve_chat", "@default"),
         ("transfer_one_message", 77, "target-chat", "url:private-source-chat:77"),
     ]
+    assert transfer_kwargs == [{"cache": "cache-sentinel", "force_message_download": True}]
 
 
 def test_single_forward_upload_failure_does_not_fallback_to_userbot_source(fake_client, fake_event, make_message, monkeypatch):
