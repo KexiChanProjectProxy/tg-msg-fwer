@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 from types import SimpleNamespace
 
 import bot as bot_module
@@ -247,6 +248,59 @@ def test_pending_single_forward_falls_back_to_userbot_only_after_bot_download_fa
         ("resolve_message", 99),
     ]
     assert transfers == [(userbot, 99, "target-chat", "url:source-chat:99")]
+
+
+def test_pending_single_forward_shows_readable_download_error_before_source_fallback(fake_client, fake_event, make_message, monkeypatch):
+    bot_client = fake_client
+    userbot = fake_client.__class__()
+    fwd_message = make_document_message(
+        make_message,
+        message_id=142,
+        text="pending caption",
+        fwd_from=SimpleNamespace(channel_id=888, channel_post=99),
+    )
+    event = fake_event(sender_id=78, text="@target", message=make_message(id=401, text="@target", message="@target"))
+    bot_module.pending_forwards[78] = fwd_message
+    source_message = make_document_message(make_message, message_id=99, text="source caption")
+
+    bot_module.register_handlers(bot_client, userbot, db=None, file_cache="cache-sentinel")
+    handle = handler(bot_client, "handle_forwarded_or_target")
+
+    monkeypatch.setattr(bot_module, "is_admin", lambda _sender_id: True)
+    monkeypatch.setattr(bot_module, "build_message_url", lambda chat, msg_id: f"url:{chat}:{msg_id}")
+
+    async def fake_resolve_chat(_client, ref):
+        return {"@target": "target-chat", "-100888": "source-chat"}[ref]
+
+    async def fake_resolve_message(*_args, **_kwargs):
+        return [source_message]
+
+    async def fake_download(*_args, **_kwargs):
+        raise bot_module.MediaDownloadError(
+            message_id=142,
+            phase="verifying downloaded file",
+            temp_path=Path("tmp/dl_142.bin"),
+            downloaded_path=Path("tmp/missing.bin"),
+            cause=FileNotFoundError("tmp/missing.bin"),
+        )
+
+    async def fake_transfer_one_message(*_args, **_kwargs):
+        return "uploaded"
+
+    monkeypatch.setattr(bot_module, "resolve_chat", fake_resolve_chat)
+    monkeypatch.setattr(bot_module, "resolve_message", fake_resolve_message)
+    monkeypatch.setattr(bot_module, "download_to_file", fake_download)
+    monkeypatch.setattr(bot_module, "transfer_one_message", fake_transfer_one_message)
+
+    run(handle(event))
+
+    status = event.replies[0]
+    assert status.edits == [
+        "Downloading media...",
+        f"Media download failed for message 142 during verifying downloaded file at tmp/missing.bin (cwd={Path.cwd()}): FileNotFoundError: tmp/missing.bin. Fetching original message from source channel...",
+        "Transferring...",
+        "Done!",
+    ]
 
 
 def test_auto_route_album_falls_back_as_a_whole_after_bot_download_failure(fake_client, fake_event, make_message, monkeypatch):

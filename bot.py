@@ -15,6 +15,7 @@ from media import get_media_type
 from models import TransferStatus
 from telegraph import find_telegraph_urls, fetch_telegraph_page, download_telegraph_images
 from transfer import (
+    MediaDownloadError,
     download_to_file,
     resolve_chat,
     resolve_message,
@@ -65,6 +66,15 @@ def is_admin(user_id: int) -> bool:
 
 
 def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cache=None):
+
+    def _forward_download_status(error: Exception, *, album: bool = False) -> str:
+        if isinstance(error, MediaDownloadError):
+            if album:
+                return f"{error}. Fetching original album from source channel..."
+            return f"{error}. Fetching original message from source channel..."
+        if album:
+            return "Fetching original album from source channel..."
+        return "Fetching original message from source channel..."
 
     ALBUM_COLLECT_DELAY = 0.5  # seconds to wait for all album members
     _album_buffer: Dict[int, List[Message]] = {}   # grouped_id -> messages
@@ -421,7 +431,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             channel_id = getattr(fwd_from, "channel_id", None)
             channel_post = getattr(fwd_from, "channel_post", None)
             if channel_id and channel_post:
-                await status_msg.edit("Fetching original message from source channel...")
+                await status_msg.edit(_forward_download_status(bot_error))
                 source_ref = f"-100{channel_id}"
                 try:
                     source_chat = await resolve_chat(userbot, source_ref)
@@ -496,7 +506,7 @@ def register_handlers(bot: TelegramClient, userbot: TelegramClient, db, file_cac
             return True
         except Exception as bot_error:
             if channel_id and channel_post:
-                await status_msg.edit("Fetching original album from source channel...")
+                await status_msg.edit(_forward_download_status(bot_error, album=True))
                 source_ref = f"-100{channel_id}"
                 try:
                     source_chat = await resolve_chat(userbot, source_ref)
